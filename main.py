@@ -1,4 +1,5 @@
 import requests
+from bs4 import BeautifulSoup
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -9,62 +10,57 @@ EMAIL_USER = os.environ.get("EMAIL_USER")
 EMAIL_PASS = os.environ.get("EMAIL_PASS")
 EMAIL_RECEIVER = "eglantinshaba@gmail.com"
 
-# Elenco comuni (inclusa la variante per Lalio)
-COMUNI_TARGET = ["AZZANO SAN PAOLO", "STEZZANO", "GRASSOBBIO", "LALLIO", "LALIO", "ZANICA", "TREVIOLO"]
+# Elenco comuni per Astegiudiziarie.it (formato URL)
+# Nota: Usiamo i nomi separati da trattino per l'indirizzo web
+COMUNI = ["azzano-san-paolo", "stezzano", "grassobbio", "lallio", "zanica", "treviolo"]
 
-def cerca_tutte_le_aste():
-    print("🚀 Avvio scansione totale Provincia di Bergamo...")
+def cerca_aste_nuovo_sito():
+    print("Avvio scansione su Astegiudiziarie.it...")
     risultati_finali = []
     
-    # API ufficiale del Portale Vendite Pubbliche
-    url = "https://wvgafsu780-dsn.algolia.net/1/indexes/PROPORTAL/query"
-    params = {
-        "x-algolia-application-id": "WVGAFSU780",
-        "x-algolia-api-key": "685934188b4952026856019688439e6a"
+    # Headers per sembrare un utente reale da cellulare
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; SM-A556B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
     }
-    
-    # Chiediamo TUTTE le aste in provincia di Bergamo (BG) senza filtri restrittivi
-    # Aumentiamo i risultati a 200 per essere sicuri di prendere tutto
-    payload = {
-        "params": "filters=provincia:BG AND regione:Lombardia&hitsPerPage=200"
-    }
-    
-    try:
-        response = requests.post(url, params=params, json=payload, timeout=25)
-        data = response.json()
-        hits = data.get('hits', [])
-        
-        print(f"Scansione completata. Analisi di {len(hits)} annunci totali in provincia...")
 
-        for hit in hits:
-            comune_asta = str(hit.get('comune', '')).upper()
-            titolo = str(hit.get('titolo', '')).upper()
-            indirizzo = str(hit.get('indirizzo', '')).upper()
-            
-            # Controlliamo se uno dei tuoi comuni è presente nel testo o nel campo comune
-            match = False
-            for c in COMUNI_TARGET:
-                if c in comune_asta or c in titolo or c in indirizzo:
-                    match = True
-                    comune_trovato = c
-                    break
-            
-            if match:
-                id_asta = hit.get('id')
-                link = f"https://pvp.giustizia.it/pvp/it/dettaglio_annuncio.page?contentId={id_asta}"
-                prezzo = hit.get('prezzo_base', 'N/A')
+    for comune in COMUNI:
+        url_ricerca = f"https://www.astegiudiziarie.it/vendite-giudiziarie-immobiliari/bergamo/{comune}"
+        print(f"Controllo: {comune}...")
+        
+        try:
+            response = requests.get(url_ricerca, headers=headers, timeout=20)
+            if response.status_code != 200:
+                continue
                 
-                entry = (f"📍 COMUNE: {comune_asta}\n"
-                         f"🏠 OGGETTO: {titolo[:100]}...\n"
-                         f"💰 PREZZO: {prezzo}€\n"
-                         f"🔗 LINK: {link}")
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Cerchiamo i blocchi degli annunci (le "card")
+            annunci = soup.find_all('div', class_='annuncio')
+            
+            for asta in annunci:
+                # Estraiamo il titolo/descrizione
+                titolo_tag = asta.find('h4') or asta.find('div', class_='titolo')
+                titolo = titolo_tag.get_text(strip=True) if titolo_tag else "Immobile"
+                
+                # Estraiamo il prezzo
+                prezzo_tag = asta.find('div', class_='prezzo') or asta.find('span', class_='prezzo')
+                prezzo = prezzo_tag.get_text(strip=True) if prezzo_tag else "Vedi sito"
+                
+                # Estraiamo il link
+                link_tag = asta.find('a', href=True)
+                link_parziale = link_tag['href']
+                link_completo = f"https://www.astegiudiziarie.it{link_parziale}" if not link_parziale.startswith('http') else link_parziale
+                
+                entry = (f"📍 LOCALITÀ: {comune.replace('-', ' ').upper()}\n"
+                         f"🏠 INFO: {titolo[:100]}...\n"
+                         f"💰 PREZZO: {prezzo}\n"
+                         f"🔗 LINK: {link_completo}")
                 
                 if entry not in risultati_finali:
                     risultati_finali.append(entry)
-                    print(f"✅ TROVATA: {comune_asta}")
-
-    except Exception as e:
-        print(f"❌ Errore durante la scansione: {e}")
+                    
+        except Exception as e:
+            print(f"Errore su {comune}: {e}")
 
     return risultati_finali
 
@@ -73,12 +69,13 @@ def invia_mail(aste):
     msg['From'] = EMAIL_USER
     msg['To'] = EMAIL_RECEIVER
     
+    # Titolo mail semplice come preferisci
     if aste:
-        msg['Subject'] = f"🔔 {len(aste)} ASTE TROVATE a Bergamo"
-        corpo = "L'agente ha trovato gli annunci attivi per i tuoi comuni:\n\n" + "\n\n---\n\n".join(aste)
+        msg['Subject'] = f"aggiornamento aste: {len(aste)} annunci trovati"
+        corpo = "Ecco gli annunci trovati su astegiudiziarie.it:\n\n" + "\n\n---\n\n".join(aste)
     else:
-        msg['Subject'] = "🔍 Report Aste: Nessuna novità"
-        corpo = "L'agente ha controllato tutto il database di Bergamo ma attualmente non ci sono aste attive per i comuni selezionati."
+        msg['Subject'] = "nessun annuncio oggi"
+        corpo = "Ho controllato astegiudiziarie.it ma non ci sono nuove aste per i tuoi comuni."
 
     msg.attach(MIMEText(corpo, 'plain'))
 
@@ -87,10 +84,10 @@ def invia_mail(aste):
         server.login(EMAIL_USER, EMAIL_PASS)
         server.send_message(msg)
         server.quit()
-        print("📧 Mail inviata!")
+        print("Mail inviata!")
     except Exception as e:
-        print(f"❌ Errore mail: {e}")
+        print(f"Errore mail: {e}")
 
 if __name__ == "__main__":
-    lista = cerca_tutte_le_aste()
+    lista = cerca_aste_nuovo_sito()
     invia_mail(lista)
