@@ -1,0 +1,19 @@
+name: Controllo Giornaliero
+on:
+  schedule:
+    - cron: '0 8 * * *'  # Ore 09:00 Italiane circa
+  workflow_dispatch:      # Permette avvio manuale
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      - run: pip install -r requirements.txt
+      - env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+        run: python main.py
