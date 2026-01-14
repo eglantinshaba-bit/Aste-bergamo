@@ -1,11 +1,12 @@
 """
 Aste Bergamo - Scraper "Vendite Giudiziarie" (Tribunale di Bergamo)
 
-Fix principali (v2):
+Fix principali (v3):
 - Gestione robusta del banner cookie Iubenda che intercetta i click (iubenda-cs-banner)
 - Operazioni (select/click) eseguite SOLO nel form "attivo" (quello che contiene "Mostra il risultato")
-- Click su "Mostra il risultato" con fallback force=True
-- Attese più robuste per caricamento Province/Comuni
+- Provincia bloccata su Bergamo
+- Comuni target: Azzano San Paolo, Stezzano, Zanica, Lallio, Grassobio
+- Per ogni annuncio: LINK DIRETTO (priorità a PVP/Giustizia/esvalabs) + lista link trovati nel testo
 
 ENV richieste per invio email (SMTP):
   SMTP_HOST     es. smtp.gmail.com
@@ -29,9 +30,8 @@ import smtplib
 from dataclasses import dataclass
 from datetime import datetime, date
 from email.message import EmailMessage
-from typing import Iterable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
-from bs4 import BeautifulSoup  # type: ignore
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError  # type: ignore
 
 
@@ -40,6 +40,7 @@ REGIONE = "Lombardia"
 PROVINCIA = "Bergamo"
 
 COMUNI_TARGET = [
+    "Azzano San Paolo",
     "Stezzano",
     "Zanica",
     "Lallio",
@@ -54,6 +55,7 @@ class Notice:
     comune: str
     header: str
     body: str
+    direct_link: str
     links: Tuple[str, ...]
     sale_date: Optional[date]
 
@@ -115,26 +117,6 @@ def _pick_sale_date(block_text: str) -> Optional[date]:
     return max(dates)
 
 
-def _extract_links_from_html(html: str) -> Tuple[str, ...]:
-    soup = BeautifulSoup(html, "html.parser")
-    hrefs: List[str] = []
-    for a in soup.select("a[href]"):
-        href = (a.get("href") or "").strip()
-        if not href or href.startswith("#"):
-            continue
-        if href.startswith("/"):
-            href = "https://www.tribunale.bergamo.it" + href
-        hrefs.append(href)
-
-    out: List[str] = []
-    seen = set()
-    for h in hrefs:
-        if h not in seen:
-            out.append(h)
-            seen.add(h)
-    return tuple(out)
-
-
 def _split_notices_from_page_text(page_text: str) -> List[str]:
     text = _normalize_whitespace(page_text)
     start = text.find("TRIBUNALE")
@@ -169,8 +151,6 @@ def _dismiss_iubenda(page, timeout_ms: int = 4000) -> None:
     except Exception:
         return
 
-    log("Iubenda banner visible -> try accept/reject/close")
-
     candidates = [
         "#iubenda-cs-accept-btn",
         ".iubenda-cs-accept-btn",
@@ -200,7 +180,7 @@ def _dismiss_iubenda(page, timeout_ms: int = 4000) -> None:
         except Exception:
             continue
 
-    log("Iubenda banner not dismissable -> hide via JS fallback")
+    # fallback: nasconde overlay
     try:
         page.evaluate(
             """() => {
@@ -235,7 +215,7 @@ def _get_active_form(page):
     return form
 
 
-def _find_visible_select_index_by_options(scope, must_contain: Iterable[str], timeout_ms: int = 8000) -> int:
+def _find_visible_select_index_by_options(scope, must_contain: List[str], timeout_ms: int = 8000) -> int:
     must = [m.lower() for m in must_contain]
     selects = scope.locator("select")
     count = selects.count()
@@ -257,7 +237,7 @@ def _find_visible_select_index_by_options(scope, must_contain: Iterable[str], ti
                 continue
         scope.page.wait_for_timeout(250)
 
-    raise RuntimeError(f"Impossibile trovare <select> visibile con opzioni {list(must_contain)}.")
+    raise RuntimeError(f"Impossibile trovare <select> visibile con opzioni {must_contain}.")
 
 
 def _select_option_by_label(scope, select_nth: int, label: str, timeout_ms: int = 10000) -> None:
@@ -292,7 +272,6 @@ def _wait_select_has_option(scope, select_nth: int, label: str, timeout_ms: int 
 
 
 def scrape_for_comune(comune: str) -> List[Notice]:
-    log(f"Scrape comune={comune}")
     notices: List[Notice] = []
 
     with sync_playwright() as p:
@@ -301,9 +280,9 @@ def scrape_for_comune(comune: str) -> List[Notice]:
         page = context.new_page()
 
         page.goto(TRIBUNALE_URL, wait_until="domcontentloaded", timeout=60000)
-
         _dismiss_iubenda(page)
 
+        # tab "Beni Immobili" + "Ricerca Generale" (se serve)
         try:
             page.get_by_text("Beni Immobili", exact=False).first.click(timeout=1500)
         except Exception:
@@ -315,13 +294,16 @@ def scrape_for_comune(comune: str) -> List[Notice]:
 
         form = _get_active_form(page)
 
+        # Regione
         idx_regione = _find_visible_select_index_by_options(form, [REGIONE, "Veneto"], timeout_ms=8000)
         _select_option_by_label(form, idx_regione, REGIONE)
 
+        # Provincia (Bergamo)
         idx_prov = _find_visible_select_index_by_options(form, [PROVINCIA], timeout_ms=12000)
         _wait_select_has_option(form, idx_prov, PROVINCIA, timeout_ms=12000)
         _select_option_by_label(form, idx_prov, PROVINCIA)
 
+        # Comune
         comune_set = False
         try:
             idx_com = _find_visible_select_index_by_options(form, [comune], timeout_ms=15000)
@@ -342,12 +324,14 @@ def scrape_for_comune(comune: str) -> List[Notice]:
             except Exception as e:
                 raise RuntimeError(f"Impossibile impostare il Comune '{comune}' (né select né input). Dettaglio: {e}")
 
+        # Aste per pagina
         try:
             idx_pp = _find_visible_select_index_by_options(form, ["10", "25", "50"], timeout_ms=2500)
             _select_option_by_label(form, idx_pp, PER_PAGE, timeout_ms=2500)
         except Exception:
             pass
 
+        # disabilita aste passate se checkato
         try:
             cb = form.get_by_label(re.compile(r"Includi\s+le\s+aste\s+passate", re.I))
             if cb.is_visible() and cb.is_checked():
@@ -356,6 +340,8 @@ def scrape_for_comune(comune: str) -> List[Notice]:
             pass
 
         _dismiss_iubenda(page)
+
+        # click mostra risultato (con fallback force)
         submit = form.locator('input[type="submit"][value="Mostra il risultato"]').first
         try:
             submit.scroll_into_view_if_needed(timeout=2000)
@@ -385,17 +371,19 @@ def scrape_for_comune(comune: str) -> List[Notice]:
             seg = _normalize_whitespace(page_text)
             blocks = re.split(r"\n(?=LOTTO\s+\w+)", seg)
 
-        html = page.content()
-        all_links = _extract_links_from_html(html)
+        # (html non essenziale qui, ma lasciato per future estensioni)
+        _ = page.content()
 
         for b in blocks:
             b_norm = _normalize_whitespace(b)
             header = b_norm.splitlines()[0] if b_norm else "Annuncio"
             sale_dt = _pick_sale_date(b_norm)
 
+            # filtra annunci passati
             if sale_dt is not None and sale_dt < date.today():
                 continue
 
+            # URL presenti nel testo del singolo annuncio
             urls = re.findall(r"(https?://\S+|www\.\S+)", b_norm)
             cleaned: List[str] = []
             for u in urls:
@@ -404,17 +392,33 @@ def scrape_for_comune(comune: str) -> List[Notice]:
                     u = "https://" + u
                 cleaned.append(u)
 
-            pvp_links = [l for l in all_links if "portalevenditepubbliche" in l.lower()]
+            # Link associati al singolo annuncio (solo quelli nel testo)
             linkset: List[str] = []
-            for l in cleaned + pvp_links:
+            for l in cleaned:
                 if l not in linkset:
                     linkset.append(l)
+
+            # Link diretto per annuncio:
+            # - preferisce Portale Vendite Pubbliche / Giustizia (o redirect esvalabs)
+            # - fallback: primo link trovato, oppure pagina ricerca
+            def _is_direct(u: str) -> bool:
+                u = u.lower()
+                return (
+                    "portalevenditepubbliche" in u
+                    or "giustizia.it" in u
+                    or "esvalabs" in u
+                )
+
+            direct_link = next((l for l in linkset if _is_direct(l)), "")
+            if not direct_link:
+                direct_link = linkset[0] if linkset else TRIBUNALE_URL
 
             notices.append(
                 Notice(
                     comune=comune,
                     header=header,
                     body=b_norm,
+                    direct_link=direct_link,
                     links=tuple(linkset),
                     sale_date=sale_dt,
                 )
@@ -460,7 +464,10 @@ def build_email_html(all_notices: List[Notice]) -> Tuple[str, str]:
             sale = n.sale_date.strftime("%d/%m/%Y") if n.sale_date else "n/d"
             parts.append("<hr/>")
             parts.append(f"<p><b>{i}. {esc(n.header)}</b><br/>")
-            parts.append(f"<b>Data rilevata:</b> {esc(sale)}</p>")
+            parts.append(f"<b>Data rilevata:</b> {esc(sale)}<br/>")
+            parts.append(
+                f"<b>Link diretto:</b> <a href='{esc(n.direct_link)}'>{esc(n.direct_link)}</a></p>"
+            )
 
             body = esc(n.body)
             if len(body) > 3000:
@@ -472,7 +479,7 @@ def build_email_html(all_notices: List[Notice]) -> Tuple[str, str]:
 
             if n.links:
                 parts.append(
-                    "<p><b>Link:</b><br/>"
+                    "<p><b>Altri link trovati:</b><br/>"
                     + "<br/>".join(f"<a href='{esc(l)}'>{esc(l)}</a>" for l in n.links)
                     + "</p>"
                 )
@@ -522,7 +529,6 @@ def main() -> int:
     for comune in COMUNI_TARGET:
         try:
             notices = scrape_for_comune(comune)
-            log(f"{comune}: {len(notices)} annunci")
             all_notices.extend(notices)
         except Exception as e:
             all_notices.append(
@@ -530,6 +536,7 @@ def main() -> int:
                     comune=comune,
                     header=f"ERRORE scraping per {comune}",
                     body=str(e),
+                    direct_link=TRIBUNALE_URL,
                     links=(TRIBUNALE_URL,),
                     sale_date=None,
                 )
@@ -544,7 +551,7 @@ def main() -> int:
         print(subject)
         print("=" * len(subject))
         for n in all_notices:
-            print(f"\n[{n.comune}] {n.header} (data={n.sale_date})")
+            print(f"\n[{n.comune}] {n.header} (data={n.sale_date})\nLink diretto: {n.direct_link}")
             print(n.body[:500])
 
     return 0
