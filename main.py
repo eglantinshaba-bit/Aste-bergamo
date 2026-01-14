@@ -1,33 +1,9 @@
-"""
-Aste Bergamo - Scraper "Vendite Giudiziarie" (Tribunale di Bergamo)
-
-Obiettivo:
-- Aprire https://www.tribunale.bergamo.it/vendite-giudiziarie_164.html
-- Selezionare:
-  - Beni Immobili
-  - Ricerca Generale
-  - Regione: Lombardia
-  - Provincia: Bergamo
-  - Comune: (lista target)
-- Estrarre TUTTI gli annunci attivi e inviare una mail con:
-  - Comune
-  - Titolo annuncio
-  - Testo annuncio (sintesi)
-  - Link diretto (priorità PDF Avviso/Perizia)
-  - (opzionale) altri link
-
-Nota:
-Il sito usa un banner cookie (Iubenda) che può bloccare i click.
-Lo script lo gestisce in automatico.
-
-Repo-ready per GitHub Actions.
-"""
-
 from __future__ import annotations
 
 import os
 import re
 import smtplib
+import time
 import traceback
 from dataclasses import dataclass
 from datetime import date
@@ -53,7 +29,7 @@ COMUNI_TARGET = [
     "Grassobio",
 ]
 
-ASTA_PER_PAGINA = "50"  # 10 / 25 / 50
+ASTA_PER_PAGINA = "50"
 DEFAULT_TIMEOUT_MS = 30_000
 
 
@@ -100,7 +76,8 @@ def _normalize_url(url: str) -> str:
 
 def _try_extract_real_url_from_tracking(url: str) -> str:
     """
-    Decodifica i link 'urlsand.esvalabs.com' che includono la vera URL nel parametro 'u='.
+    Decodifica i link 'urlsand.esvalabs.com' che includono la vera URL nel parametro 'u='
+    (evita 403, non fa richieste).
     """
     u = (url or "").strip()
     if not u:
@@ -127,13 +104,9 @@ def _try_extract_real_url_from_tracking(url: str) -> str:
 
         candidate = m.group(1).strip()
 
-        # se contiene più "http://", prendi l’ultimo
         http_positions = [m.start() for m in re.finditer(r"https?://", candidate)]
         if len(http_positions) >= 2:
             candidate = candidate[http_positions[-1] :]
-
-        if "portalevenditepubbliche.giustizia.it" in candidate:
-            return candidate
 
         return candidate
     except Exception:
@@ -142,9 +115,9 @@ def _try_extract_real_url_from_tracking(url: str) -> str:
 
 def _resolve_final_url(url: str, timeout: int = 10) -> str:
     """
-    Restituisce un link "diretto" e stabile.
-    1) Se è tracking esvalabs -> decodifica e restituisce l'URL reale (senza fare richieste).
-    2) Altrimenti segue redirect HTTP.
+    Restituisce URL "diretto":
+    - se tracking esvalabs -> decodifica
+    - altrimenti segue redirect HTTP
     """
     u = _normalize_url(url)
     if not u:
@@ -169,101 +142,24 @@ def _resolve_final_url(url: str, timeout: int = 10) -> str:
         return u
 
 
-def _looks_like_pdf(url: str, text: str) -> bool:
-    hl = (url or "").lower()
-    tl = (text or "").lower()
-
-    if ".pdf" in hl:
-        return True
-    if "pdf" in hl and any(k in hl for k in ["file=", "download", "doc", "alleg", "attach"]):
-        return True
-    if any(k in tl for k in ["avviso vendita", "avviso", "perizia", "autorizzazione gd"]):
-        return True
-    return False
-
-
-def _score_link(href: str, text: str) -> int:
-    h = (href or "").strip()
-    t = (text or "").strip()
-    if not h:
-        return -1
-
-    hl = h.lower()
-    tl = t.lower()
-
-    if hl.startswith("mailto:") or hl.startswith("tel:"):
-        return -1
-    if any(hl.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico"]):
-        return -1
-
-    score = 0
-
-    # 1) PDF (Avviso/Perizia) = top
-    if _looks_like_pdf(h, t):
-        score += 120
-        if "avviso" in tl:
-            score += 25
-        if "perizia" in tl:
-            score += 15
-        if "autorizzazione" in tl:
-            score += 10
-
-    # 2) PVP
-    if "portalevenditepubbliche.giustizia.it" in hl:
-        score += 90
-
-    # 3) tracking (lo decodifichiamo)
-    if "esvalabs.com" in hl:
-        score += 60
-
-    # 4) dettagli / lotto
-    if any(k in tl for k in ["dettaglio", "scheda", "procedura", "lotto"]):
-        score += 20
-    if any(k in hl for k in ["vendite", "asta", "lotto", "procedura"]):
-        score += 15
-
-    # 5) dominio tribunale
-    if "tribunale.bergamo.it" in hl:
-        score += 10
-
-    return score
-
-
-def _pick_direct_link(link_objs: List[Dict[str, str]]) -> str:
-    best_href = ""
-    best_score = -1
-    for obj in link_objs:
-        href = (obj.get("href") or "").strip()
-        text = (obj.get("text") or "").strip()
-        sc = _score_link(href, text)
-        if sc > best_score:
-            best_score = sc
-            best_href = href
-    return best_href or TRIBUNALE_URL
-
-
-def _flatten_links(link_objs: List[Dict[str, str]]) -> List[str]:
-    out: List[str] = []
-    seen = set()
-    for o in link_objs:
-        h = _normalize_url(o.get("href") or "")
-        if not h:
-            continue
-        if h not in seen:
-            seen.add(h)
-            out.append(h)
-    return out
+def _parse_sale_date(text: str) -> Optional[date]:
+    # supporta 06.06.2024 e 06/06/2024
+    m = re.search(r"(\d{1,2})[./](\d{1,2})[./](\d{4})", text or "")
+    if not m:
+        return None
+    dd, mm, yyyy = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        return date(yyyy, mm, dd)
+    except Exception:
+        return None
 
 
 # -----------------------------
 # Playwright helpers
 # -----------------------------
 def _dismiss_cookie_banner(page) -> None:
-    """
-    Accetta/chiude Iubenda (cookie banner) + fallback JS remove overlay.
-    """
     try:
-        page.wait_for_timeout(600)
+        page.wait_for_timeout(400)
 
         candidates = [
             'button:has-text("Accetta")',
@@ -281,12 +177,13 @@ def _dismiss_cookie_banner(page) -> None:
             loc = page.locator(sel).first
             if loc.count() > 0:
                 try:
-                    loc.click(timeout=1500)
-                    page.wait_for_timeout(350)
+                    loc.click(timeout=1200)
+                    page.wait_for_timeout(250)
                     return
                 except Exception:
                     pass
 
+        # fallback: rimuovi overlay
         page.evaluate(
             """
             () => {
@@ -301,186 +198,199 @@ def _dismiss_cookie_banner(page) -> None:
         pass
 
 
-def _smart_select_option(page, label_text: str, value_text: str) -> None:
-    """
-    Seleziona value_text in un <select> associato a label_text.
-    Fallback: cerca il select che contiene l’opzione richiesta.
-    """
-    value_text = value_text.strip()
-
-    # 1) prova per label
-    try:
-        sel = page.get_by_label(label_text)
-        if sel.count() > 0:
-            sel.select_option(label=value_text, timeout=DEFAULT_TIMEOUT_MS)
-            return
-    except Exception:
-        pass
-
-    # 2) cerca tra tutti i select visibili
-    selects = page.locator("select:visible")
-    for i in range(selects.count()):
-        s = selects.nth(i)
-        try:
-            options = s.locator("option").all_text_contents()
-            if any(value_text.lower() == (o or "").strip().lower() for o in options):
-                s.select_option(label=value_text, timeout=DEFAULT_TIMEOUT_MS)
-                return
-        except Exception:
-            continue
-
-    raise RuntimeError(f"Impossibile trovare <select> visibile con opzioni [{value_text}]")
-
-
 def _click_mostra_risultato(page) -> None:
-    btn = page.locator('input[type="submit"][value="Mostra il risultato"]').first
+    btn = page.locator('input[type="submit"][value="Mostra il risultato"]:visible').first
     btn.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
     _dismiss_cookie_banner(page)
     btn.click(timeout=DEFAULT_TIMEOUT_MS, force=True)
 
 
-def _wait_results_loaded(page) -> None:
+def _get_active_form(page):
+    # prende il form che contiene il bottone visibile "Mostra il risultato"
+    btn = page.locator('input[type="submit"][value="Mostra il risultato"]:visible').first
+    form = page.locator("form").filter(has=btn).first
+    if form.count() == 0:
+        raise RuntimeError("Form attivo non trovato (Mostra il risultato).")
+    return form
+
+
+def _select_option_in_active_form(page, value_label: str, max_wait_ms: int = 15_000) -> None:
+    """
+    Cerca tra i select del FORM attivo quello che contiene l'opzione value_label e la seleziona.
+    (evita di selezionare dropdown di altre tab nascoste)
+    """
+    end = time.time() + max_wait_ms / 1000.0
+    last_options_snapshot = ""
+
+    while time.time() < end:
+        form = _get_active_form(page)
+        selects = form.locator("select:visible")
+        for i in range(selects.count()):
+            s = selects.nth(i)
+            try:
+                opts = [(_strip_spaces(x)).lower() for x in s.locator("option").all_text_contents()]
+                if value_label.lower() in opts:
+                    s.select_option(label=value_label, timeout=DEFAULT_TIMEOUT_MS)
+                    return
+                last_options_snapshot = ", ".join(opts[:12])
+            except Exception:
+                continue
+
+        page.wait_for_timeout(250)
+
+    raise RuntimeError(f"Impossibile selezionare '{value_label}' nel form attivo. Ultime opzioni viste: {last_options_snapshot}")
+
+
+def _wait_results_tables(page) -> None:
+    # aspetta almeno una tabella risultati oppure messaggio "nessun risultato"
     page.wait_for_timeout(500)
-    page.wait_for_function(
-        """
-        () => {
-          const txt = document.body && document.body.innerText ? document.body.innerText : '';
-          return txt.toUpperCase().includes('TRIBUNALE DI ');
-        }
-        """,
-        timeout=DEFAULT_TIMEOUT_MS,
-    )
-
-
-def _extract_blocks_from_page(page) -> List[Dict]:
-    """
-    Raggruppa blocchi da "TRIBUNALE DI ..." fino al successivo.
-    Raccoglie:
-    - <a href>
-    - URL dentro onclick / data-url / data-href
-    """
-    js = r"""
-    () => {
-      const root = document.body;
-      if (!root) return [];
-
-      const norm = (s) => (s || '').replace(/\s+/g,' ').trim();
-
-      const extractUrlsFromString = (s) => {
-        const out = [];
-        if (!s) return out;
-        // URL complete e path relativi PDF
-        const re = /((https?:\/\/)[^'"\s<>]+)|((\/)[^'"\s<>]+(\.pdf|\.PDF))/g;
-        let m;
-        while ((m = re.exec(s)) !== null) {
-          const u = m[0];
-          if (!u) continue;
-          out.push(u);
-        }
-        if (s.includes('portalevenditepubbliche.giustizia.it')) {
-          out.push('https://www.portalevenditepubbliche.giustizia.it');
-        }
-        return out;
-      };
-
-      const isTitle = (el) => {
-        if (!el) return false;
-        const t = norm(el.innerText);
-        if (!t) return false;
-        const tu = t.toUpperCase();
-        if (!tu.startsWith('TRIBUNALE DI ')) return false;
-        if (t.length > 140) return false;
-        return true;
-      };
-
-      const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
-      const titles = [];
-      let node;
-      while (node = walker.nextNode()) {
-        if (isTitle(node)) titles.push(node);
-      }
-      if (!titles.length) return [];
-
-      const titleSet = new Set(titles);
-
-      const walker2 = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
-      const blocks = [];
-      let current = null;
-
-      const pushCurrent = () => {
-        if (!current) return;
-        const body = norm(current.textParts.join('\n'));
-        blocks.push({ header: current.header, body, links: current.links });
-      };
-
-      while (node = walker2.nextNode()) {
-
-        if (titleSet.has(node)) {
-          pushCurrent();
-          current = { header: norm(node.innerText), textParts: [], links: [] };
-          continue;
-        }
-
-        if (!current) continue;
-
-        // <a href>
-        if ((node.tagName || '').toUpperCase() === 'A') {
-          const href = node.href || node.getAttribute('href') || '';
-          if (href) {
-            current.links.push({ href: href, text: norm(node.innerText) || norm(node.getAttribute('title')) });
-          }
-          const onclick = node.getAttribute('onclick') || '';
-          extractUrlsFromString(onclick).forEach(u => current.links.push({ href: u, text: norm(node.innerText) || 'Allegato' }));
-        }
-
-        // onclick / data-url anche su altri elementi
-        const onclick2 = node.getAttribute && node.getAttribute('onclick');
-        if (onclick2) {
-          extractUrlsFromString(onclick2).forEach(u => current.links.push({ href: u, text: 'Allegato' }));
-        }
-        const dataHref = node.getAttribute && (node.getAttribute('data-href') || node.getAttribute('data-url') || node.getAttribute('data-file'));
-        if (dataHref) {
-          current.links.push({ href: dataHref, text: 'Allegato' });
-        }
-
-        // testo utile
-        const tag = (node.tagName || '').toUpperCase();
-        if (['P','LI'].includes(tag)) {
-          const t = norm(node.innerText);
-          if (t && !t.toUpperCase().startsWith('TRIBUNALE DI ')) current.textParts.push(t);
-        }
-      }
-
-      pushCurrent();
-
-      // dedup links
-      blocks.forEach(b => {
-        const seen = new Set();
-        b.links = (b.links || []).filter(o => {
-          const h = (o.href || '').trim();
-          if (!h) return false;
-          if (seen.has(h)) return false;
-          seen.add(h);
-          return true;
-        });
-      });
-
-      return blocks;
-    }
-    """
-    blocks: List[Dict] = page.evaluate(js)
-    return blocks or []
-
-
-def _parse_sale_date(text: str) -> Optional[date]:
-    m = re.search(r"(\d{1,2})[./](\d{1,2})[./](\d{4})", text or "")
-    if not m:
-        return None
-    dd, mm, yyyy = int(m.group(1)), int(m.group(2)), int(m.group(3))
     try:
-        return date(yyyy, mm, dd)
+        page.wait_for_function(
+            """
+            () => {
+              const t = document.querySelectorAll('table.table-blu.table-bordered');
+              if (t && t.length > 0) return true;
+              const txt = document.body ? document.body.innerText.toLowerCase() : '';
+              return txt.includes('nessun') && txt.includes('risultat');
+            }
+            """,
+            timeout=DEFAULT_TIMEOUT_MS,
+        )
     except Exception:
-        return None
+        pass
+
+
+def _extract_notices_from_tables(page, comune: str) -> List[Notice]:
+    """
+    Estrae gli annunci SOLO dalle tabelle risultati:
+    <table class="table table-blu table-bordered"> ... </table>
+    Dentro trovi sempre:
+    - titolo in thead (p o th)
+    - descrizione in tbody (prima riga)
+    - link PDF in seconda riga (Avviso vendita / Perizia / Foto / Planimetria)
+    """
+    tables = page.locator("table.table-blu.table-bordered")
+    n_tables = tables.count()
+
+    if n_tables == 0:
+        return []
+
+    notices: List[Notice] = []
+
+    for i in range(n_tables):
+        t = tables.nth(i)
+
+        # Header
+        title_loc = t.locator("thead p, thead th").first
+        header = ""
+        try:
+            if title_loc.count() > 0:
+                header = _strip_spaces(title_loc.inner_text())
+        except Exception:
+            header = ""
+
+        # evita footer/robe strane
+        header_up = (header or "").upper()
+        if header_up.startswith("TRIBUNALE DI BERGAMO - VIA BORFURO"):
+            continue
+        if header and not re.search(r"\b(LOTTO|N\.|N°|RG|R\.G)\b", header_up):
+            # se non sembra un annuncio vero, skip
+            continue
+
+        if not header:
+            header = "Annuncio"
+
+        # Body
+        body_text = ""
+        try:
+            first_row = t.locator("tbody tr").first
+            body_text = _strip_spaces(first_row.inner_text())
+        except Exception:
+            body_text = ""
+
+        # Links
+        link_objs: List[dict] = []
+        anchors = t.locator("a[href]")
+        for k in range(anchors.count()):
+            a = anchors.nth(k)
+            try:
+                href = a.get_attribute("href") or ""
+                href = _normalize_url(href)
+                if not href:
+                    continue
+                if href.startswith("mailto:") or "/cdn-cgi/l/email-protection" in href:
+                    continue
+
+                # label = testo della cella (utile per capire "Avviso vendita")
+                label = ""
+                try:
+                    label = a.evaluate("el => (el.closest('td') && el.closest('td').innerText) ? el.closest('td').innerText : el.innerText")
+                    label = _strip_spaces(label)
+                except Exception:
+                    label = ""
+
+                link_objs.append({"href": href, "label": label})
+            except Exception:
+                continue
+
+        # dedup
+        seen = set()
+        uniq_links: List[dict] = []
+        for o in link_objs:
+            h = o["href"]
+            if h in seen:
+                continue
+            seen.add(h)
+            uniq_links.append(o)
+
+        # scegli link diretto:
+        # 1) PDF che contiene "Avviso vendita" nella label
+        direct = ""
+        for o in uniq_links:
+            if o["href"].lower().endswith(".pdf") and "avviso vendita" in (o["label"] or "").lower():
+                direct = o["href"]
+                break
+
+        # 2) primo PDF
+        if not direct:
+            for o in uniq_links:
+                if o["href"].lower().endswith(".pdf"):
+                    direct = o["href"]
+                    break
+
+        # 3) link PVP o altro
+        if not direct:
+            for o in uniq_links:
+                if "portalevenditepubbliche.giustizia.it" in o["href"].lower() or "esvalabs.com" in o["href"].lower():
+                    direct = _resolve_final_url(o["href"])
+                    break
+
+        # 4) fallback pagina principale
+        if not direct:
+            direct = TRIBUNALE_URL
+
+        # se tracking -> decodifica
+        direct = _resolve_final_url(direct)
+
+        # data vendita (se presente nel testo)
+        sale_dt = _parse_sale_date(body_text + " " + header)
+
+        # body limit per email
+        if len(body_text) > 3200:
+            body_text = body_text[:3200] + "…"
+
+        notices.append(
+            Notice(
+                comune=comune,
+                header=header,
+                body=body_text,
+                direct_link=direct,
+                links=tuple([o["href"] for o in uniq_links][:10]),
+                sale_date=sale_dt,
+            )
+        )
+
+    return notices
 
 
 def scrape_for_comune(comune: str) -> List[Notice]:
@@ -496,75 +406,36 @@ def scrape_for_comune(comune: str) -> List[Notice]:
             _dismiss_cookie_banner(page)
 
             # TAB: Beni Immobili
-            try:
-                page.get_by_role("link", name=re.compile(r"Beni\s+Immobili", re.I)).click(timeout=DEFAULT_TIMEOUT_MS)
-            except Exception:
-                page.get_by_text("Beni Immobili", exact=False).first.click(timeout=DEFAULT_TIMEOUT_MS)
+            page.get_by_text("Beni Immobili", exact=False).first.click(timeout=DEFAULT_TIMEOUT_MS)
+            page.wait_for_timeout(400)
 
             # SUBTAB: Ricerca Generale
-            try:
-                page.get_by_role("link", name=re.compile(r"Ricerca\s+Generale", re.I)).click(timeout=DEFAULT_TIMEOUT_MS)
-            except Exception:
-                page.get_by_text("Ricerca Generale", exact=False).first.click(timeout=DEFAULT_TIMEOUT_MS)
+            page.get_by_text("Ricerca Generale", exact=False).first.click(timeout=DEFAULT_TIMEOUT_MS)
+            page.wait_for_timeout(400)
 
             _dismiss_cookie_banner(page)
 
-            # Regione / Provincia / Comune
-            _smart_select_option(page, "Regione", REGIONE)
+            # Regione / Provincia / Comune (nel form attivo)
+            _select_option_in_active_form(page, REGIONE, max_wait_ms=20_000)
             page.wait_for_timeout(500)
-            _smart_select_option(page, "Provincia", PROVINCIA)
-            page.wait_for_timeout(900)
-            _smart_select_option(page, "Comune", comune)
+
+            _select_option_in_active_form(page, PROVINCIA, max_wait_ms=20_000)
+            page.wait_for_timeout(1200)  # tempo per caricare Comuni
+
+            _select_option_in_active_form(page, comune, max_wait_ms=25_000)
 
             # Aste per pagina
             try:
-                _smart_select_option(page, "Aste per pagina", ASTA_PER_PAGINA)
+                _select_option_in_active_form(page, ASTA_PER_PAGINA, max_wait_ms=8_000)
             except Exception:
                 pass
 
             _dismiss_cookie_banner(page)
             _click_mostra_risultato(page)
-            _wait_results_loaded(page)
 
-            blocks = _extract_blocks_from_page(page)
+            _wait_results_tables(page)
 
-            notices: List[Notice] = []
-            for b in blocks:
-                header = _strip_spaces(b.get("header") or "")
-                body = (b.get("body") or "").strip()
-                link_objs = b.get("links") or []
-                flat_links = _flatten_links(link_objs)
-
-                direct_raw = _pick_direct_link(link_objs)
-                direct = _resolve_final_url(direct_raw)
-
-                sale_dt = _parse_sale_date(body + " " + header)
-
-                # SOLO attivi
-                if sale_dt is not None and sale_dt < date.today():
-                    continue
-
-                if (not direct) or direct == TRIBUNALE_URL:
-                    if flat_links:
-                        direct = _resolve_final_url(flat_links[0])
-                    else:
-                        direct = TRIBUNALE_URL
-
-                body_clean = _strip_spaces(body)
-                if len(body_clean) > 3200:
-                    body_clean = body_clean[:3200] + "…"
-
-                notices.append(
-                    Notice(
-                        comune=comune,
-                        header=header or "Annuncio",
-                        body=body_clean,
-                        direct_link=direct,
-                        links=tuple(flat_links[:10]),
-                        sale_date=sale_dt,
-                    )
-                )
-
+            notices = _extract_notices_from_tables(page, comune)
             return notices
 
         finally:
@@ -594,29 +465,33 @@ def build_email_html(all_notices: List[Notice]) -> Tuple[str, str]:
     for comune in COMUNI_TARGET:
         lst = by_comune.get(comune, [])
         html.append(f"<h3>{comune} ({len(lst)})</h3>")
+
         if not lst:
-            html.append("<p><i>Nessun annuncio attivo trovato.</i></p>")
+            html.append("<p><i>Nessun annuncio trovato.</i></p>")
             continue
 
         html.append("<ul>")
         for n in lst:
             total += 1
             sale = n.sale_date.strftime("%d/%m/%Y") if n.sale_date else "n/d"
-            html.append("<li style='margin-bottom:14px'>")
-            html.append(f"<b>{n.header}</b> – <span>Data vendita: {sale}</span><br>")
-            html.append(f"<a href='{n.direct_link}'>LINK DIRETTO ANNUNCIO</a><br>")
+            html.append("<li style='margin-bottom:16px'>")
+            html.append(f"<b>{n.header}</b> – <span>Data: {sale}</span><br>")
+
+            # LINK diretto visibile + cliccabile
+            html.append(
+                f"<div style='margin-top:6px'>"
+                f"<b>LINK DIRETTO:</b> "
+                f"<a href='{n.direct_link}'>{n.direct_link}</a>"
+                f"</div>"
+            )
+
             if n.body:
-                html.append(f"<div style='margin-top:6px;color:#222'>{n.body}</div>")
-            if n.links:
-                others = [u for u in n.links if u != n.direct_link][:3]
-                if others:
-                    html.append("<div style='margin-top:6px;font-size:12px'>Altri link: ")
-                    html.append(" | ".join([f"<a href='{u}'>apri</a>" for u in others]))
-                    html.append("</div>")
+                html.append(f"<div style='margin-top:8px;color:#222'>{n.body}</div>")
+
             html.append("</li>")
         html.append("</ul>")
 
-    html.append(f"<hr><p>Totale annunci (attivi): <b>{total}</b></p>")
+    html.append(f"<hr><p>Totale annunci: <b>{total}</b></p>")
     html.append("</body></html>")
 
     return subject, "".join(html)
@@ -679,7 +554,7 @@ def main() -> int:
         for n in all_notices:
             print(f"\n[{n.comune}] {n.header} (data={n.sale_date})")
             print(f"LINK: {n.direct_link}")
-            print(n.body[:600])
+            print(n.body[:500])
 
     return 0
 
