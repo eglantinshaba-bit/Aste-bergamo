@@ -1,26 +1,22 @@
 """
 Aste Bergamo - Scraper "Vendite Giudiziarie" (Tribunale di Bergamo)
 
-Obiettivo:
-- Aprire https://www.tribunale.bergamo.it/vendite-giudiziarie_164.html
-- Impostare filtri (Regione=Lombardia, Provincia=Bergamo, Comune=...) come nello screen
-- Estrarre gli annunci "attivi" (in pratica: escludere quelli con data vendita passata, se riconoscibile)
-- Inviare una mail di report con tutti gli annunci trovati.
+Fix principali (v2):
+- Gestione robusta del banner cookie Iubenda che intercetta i click (iubenda-cs-banner)
+- Operazioni (select/click) eseguite SOLO nel form "attivo" (quello che contiene "Mostra il risultato")
+- Click su "Mostra il risultato" con fallback force=True
+- Attese più robuste per caricamento Province/Comuni
 
-NOTE OPERATIVE (GitHub Actions):
-- Il scraping usa Playwright (Chromium) perché la pagina è dinamica.
-- Impostare le variabili d'ambiente per la mail e, opzionalmente, per il debug.
-
-ENV richieste per l'invio email:
+ENV richieste per invio email (SMTP):
   SMTP_HOST     es. smtp.gmail.com
   SMTP_PORT     es. 587
   SMTP_USER     es. account@gmail.com
-  SMTP_PASS     (Gmail: App Password, non la password normale)
+  SMTP_PASS     (Gmail: App Password)
   EMAIL_TO      destinatario (es. eglantinshaba@gmail.com)
 
 ENV opzionali:
   HEADLESS=1/0  (default 1)
-  DEBUG=1/0     (default 0) - stampa log estesi
+  DEBUG=1/0     (default 0)
 """
 
 from __future__ import annotations
@@ -50,7 +46,6 @@ COMUNI_TARGET = [
     "Grassobio",
 ]
 
-# Max risultati per pagina (se esiste il filtro)
 PER_PAGE = "50"
 
 
@@ -87,7 +82,6 @@ def _normalize_whitespace(s: str) -> str:
 
 
 _DATE_PATTERNS = [
-    # 06.06.2024 or 6.6.2024
     re.compile(r"\b(\d{1,2})[./](\d{1,2})[./](\d{4})\b"),
 ]
 
@@ -101,7 +95,6 @@ def _extract_dates(text: str) -> List[date]:
                 found.append(date(y, mth, d))
             except ValueError:
                 continue
-    # de-dup preserving order
     out: List[date] = []
     seen = set()
     for d in found:
@@ -112,11 +105,6 @@ def _extract_dates(text: str) -> List[date]:
 
 
 def _pick_sale_date(block_text: str) -> Optional[date]:
-    """
-    Heuristica:
-    - prende tutte le date rilevabili nel testo
-    - sceglie la prima data >= oggi; se nessuna, ritorna la più recente (per debug) oppure None
-    """
     dates = _extract_dates(block_text)
     if not dates:
         return None
@@ -132,16 +120,12 @@ def _extract_links_from_html(html: str) -> Tuple[str, ...]:
     hrefs: List[str] = []
     for a in soup.select("a[href]"):
         href = (a.get("href") or "").strip()
-        if not href:
+        if not href or href.startswith("#"):
             continue
-        if href.startswith("#"):
-            continue
-        # Normalizza URL relative
         if href.startswith("/"):
             href = "https://www.tribunale.bergamo.it" + href
         hrefs.append(href)
 
-    # De-dup
     out: List[str] = []
     seen = set()
     for h in hrefs:
@@ -152,13 +136,7 @@ def _extract_links_from_html(html: str) -> Tuple[str, ...]:
 
 
 def _split_notices_from_page_text(page_text: str) -> List[str]:
-    """
-    Estrae blocchi "annuncio" dal testo della pagina usando marker standard:
-    ogni annuncio spesso inizia con "TRIBUNALE DI ..." (ma possono esistere varianti).
-    """
     text = _normalize_whitespace(page_text)
-
-    # restringi alla parte tra il primo "TRIBUNALE" e il footer "Il Tribunale" (se presente)
     start = text.find("TRIBUNALE")
     if start == -1:
         return []
@@ -168,41 +146,101 @@ def _split_notices_from_page_text(page_text: str) -> List[str]:
     else:
         text = text[start:].strip()
 
-    # split su righe che iniziano con TRIBUNALE DI
     blocks = re.split(r"\n(?=TRIBUNALE\s+DI\s+)", text)
     blocks = [b.strip() for b in blocks if b.strip().startswith("TRIBUNALE")]
     return blocks
 
 
-def _click_if_present(page, candidates: Iterable[str], timeout_ms: int = 1500) -> bool:
+def _dismiss_iubenda(page, timeout_ms: int = 4000) -> None:
     """
-    Prova a cliccare uno dei testi candidati (es. per cookie banner), senza fallire se assente.
+    Se presente il banner cookie Iubenda (id=iubenda-cs-banner) lo chiude/clicca.
+    Se non riesce, lo nasconde (fallback) così non intercetta i click.
     """
-    for txt in candidates:
+    try:
+        banner = page.locator("#iubenda-cs-banner")
+        banner.wait_for(state="visible", timeout=timeout_ms)
+    except Exception:
+        return
+
+    try:
+        banner = page.locator("#iubenda-cs-banner")
+        if not banner.is_visible():
+            return
+    except Exception:
+        return
+
+    log("Iubenda banner visible -> try accept/reject/close")
+
+    candidates = [
+        "#iubenda-cs-accept-btn",
+        ".iubenda-cs-accept-btn",
+        "button:has-text('Accetta')",
+        "a:has-text('Accetta')",
+        "#iubenda-cs-reject-btn",
+        ".iubenda-cs-reject-btn",
+        "button:has-text('Rifiuta')",
+        "a:has-text('Rifiuta')",
+        ".iubenda-cs-close-btn",
+        "button:has-text('Chiudi')",
+        "button:has-text('Continua senza accettare')",
+        "a:has-text('Continua senza accettare')",
+        "button:has-text('OK')",
+    ]
+
+    for sel in candidates:
         try:
-            loc = page.get_by_role("button", name=re.compile(re.escape(txt), re.I))
-            if loc.count() == 0:
-                loc = page.get_by_text(txt, exact=False)
-            loc.first.wait_for(state="visible", timeout=timeout_ms)
-            loc.first.click()
-            log(f"Clicked: {txt}")
-            return True
+            btn = banner.locator(sel).first
+            btn.wait_for(state="visible", timeout=1200)
+            btn.click(timeout=1200)
+            page.wait_for_timeout(300)
+            if page.locator("#iubenda-cs-banner").count() == 0:
+                return
+            if not page.locator("#iubenda-cs-banner").is_visible():
+                return
         except Exception:
             continue
-    return False
+
+    log("Iubenda banner not dismissable -> hide via JS fallback")
+    try:
+        page.evaluate(
+            """() => {
+                const b = document.querySelector('#iubenda-cs-banner');
+                if (b) {
+                  b.style.pointerEvents = 'none';
+                  b.style.display = 'none';
+                }
+            }"""
+        )
+    except Exception:
+        pass
 
 
-def _find_visible_select_index_by_options(page, must_contain: Iterable[str], timeout_ms: int = 5000) -> int:
-    """
-    Cerca un <select> visibile che contenga tutte le stringhe in must_contain tra i suoi option text.
-    Ritorna l'indice (nth) del select.
-    """
+def _get_visible_submit(page):
+    subs = page.locator('input[type="submit"][value="Mostra il risultato"]')
+    for i in range(subs.count()):
+        s = subs.nth(i)
+        try:
+            if s.is_visible():
+                return s
+        except Exception:
+            continue
+    raise RuntimeError("Impossibile trovare il pulsante 'Mostra il risultato' visibile.")
+
+
+def _get_active_form(page):
+    submit = _get_visible_submit(page)
+    form = submit.locator("xpath=ancestor::form[1]")
+    if form.count() == 0:
+        raise RuntimeError("Impossibile risalire al form dal pulsante 'Mostra il risultato'.")
+    return form
+
+
+def _find_visible_select_index_by_options(scope, must_contain: Iterable[str], timeout_ms: int = 8000) -> int:
     must = [m.lower() for m in must_contain]
-    selects = page.locator("select")
+    selects = scope.locator("select")
     count = selects.count()
     deadline = datetime.now().timestamp() + (timeout_ms / 1000)
 
-    last_err: Optional[str] = None
     while datetime.now().timestamp() < deadline:
         for i in range(count):
             try:
@@ -215,25 +253,42 @@ def _find_visible_select_index_by_options(page, must_contain: Iterable[str], tim
                 ot = options_text.lower()
                 if all(m in ot for m in must):
                     return i
-            except Exception as e:
-                last_err = str(e)
+            except Exception:
                 continue
-        page.wait_for_timeout(250)
-    raise RuntimeError(
-        f"Impossibile trovare <select> visibile con opzioni {list(must_contain)}. Ultimo errore: {last_err}"
-    )
+        scope.page.wait_for_timeout(250)
+
+    raise RuntimeError(f"Impossibile trovare <select> visibile con opzioni {list(must_contain)}.")
 
 
-def _select_option_by_label(page, select_nth: int, label: str, timeout_ms: int = 8000) -> None:
-    sel = page.locator("select").nth(select_nth)
+def _select_option_by_label(scope, select_nth: int, label: str, timeout_ms: int = 10000) -> None:
+    sel = scope.locator("select").nth(select_nth)
     deadline = datetime.now().timestamp() + (timeout_ms / 1000)
+    last_err: Optional[str] = None
     while datetime.now().timestamp() < deadline:
         try:
             sel.select_option(label=label)
             return
+        except Exception as e:
+            last_err = str(e)
+            scope.page.wait_for_timeout(250)
+    raise RuntimeError(f"Impossibile selezionare '{label}' sul select #{select_nth}. Errore: {last_err}")
+
+
+def _wait_select_has_option(scope, select_nth: int, label: str, timeout_ms: int = 12000) -> None:
+    sel = scope.locator("select").nth(select_nth)
+    deadline = datetime.now().timestamp() + (timeout_ms / 1000)
+    while datetime.now().timestamp() < deadline:
+        try:
+            ok: bool = sel.evaluate(
+                """(el, val) => Array.from(el.options || []).some(o => (o.textContent||"").trim() === val)""",
+                label,
+            )
+            if ok:
+                return
         except Exception:
-            page.wait_for_timeout(250)
-    raise RuntimeError(f"Impossibile selezionare l'opzione '{label}' sul select #{select_nth}.")
+            pass
+        scope.page.wait_for_timeout(250)
+    raise RuntimeError(f"Timeout: l'opzione '{label}' non è comparsa nel select #{select_nth}.")
 
 
 def scrape_for_comune(comune: str) -> List[Notice]:
@@ -247,10 +302,8 @@ def scrape_for_comune(comune: str) -> List[Notice]:
 
         page.goto(TRIBUNALE_URL, wait_until="domcontentloaded", timeout=60000)
 
-        # Cookie banner (varianti frequenti)
-        _click_if_present(page, ["Accetta", "Accetto", "Accetta tutti", "OK"], timeout_ms=1500)
+        _dismiss_iubenda(page)
 
-        # Tab (se presenti come clickabili)
         try:
             page.get_by_text("Beni Immobili", exact=False).first.click(timeout=1500)
         except Exception:
@@ -260,50 +313,66 @@ def scrape_for_comune(comune: str) -> List[Notice]:
         except Exception:
             pass
 
-        # 1) Regione
-        idx_regione = _find_visible_select_index_by_options(page, [REGIONE, "Piemonte", "Veneto"])
-        _select_option_by_label(page, idx_regione, REGIONE)
+        form = _get_active_form(page)
 
-        # 2) Provincia (attendi popolamento)
-        idx_prov = _find_visible_select_index_by_options(page, [PROVINCIA])
-        _select_option_by_label(page, idx_prov, PROVINCIA)
+        idx_regione = _find_visible_select_index_by_options(form, [REGIONE, "Veneto"], timeout_ms=8000)
+        _select_option_by_label(form, idx_regione, REGIONE)
 
-        # 3) Comune (attendi popolamento)
-        idx_com = _find_visible_select_index_by_options(page, [comune])
-        _select_option_by_label(page, idx_com, comune)
+        idx_prov = _find_visible_select_index_by_options(form, [PROVINCIA], timeout_ms=12000)
+        _wait_select_has_option(form, idx_prov, PROVINCIA, timeout_ms=12000)
+        _select_option_by_label(form, idx_prov, PROVINCIA)
 
-        # 4) Aste per pagina (se presente)
+        comune_set = False
         try:
-            idx_pp = _find_visible_select_index_by_options(page, ["10", "25", "50"], timeout_ms=1500)
-            _select_option_by_label(page, idx_pp, PER_PAGE, timeout_ms=1500)
+            idx_com = _find_visible_select_index_by_options(form, [comune], timeout_ms=15000)
+            _wait_select_has_option(form, idx_com, comune, timeout_ms=15000)
+            _select_option_by_label(form, idx_com, comune, timeout_ms=15000)
+            comune_set = True
+        except Exception as e:
+            log(f"Comune via <select> non riuscito ({comune}): {e}")
+
+        if not comune_set:
+            try:
+                inp = form.locator("input[id*='comun' i], input[name*='comun' i]").first
+                if inp.count() and inp.is_visible():
+                    inp.click(timeout=1000)
+                    inp.fill(comune, timeout=2000)
+                    inp.press("Enter", timeout=1500)
+                    comune_set = True
+            except Exception as e:
+                raise RuntimeError(f"Impossibile impostare il Comune '{comune}' (né select né input). Dettaglio: {e}")
+
+        try:
+            idx_pp = _find_visible_select_index_by_options(form, ["10", "25", "50"], timeout_ms=2500)
+            _select_option_by_label(form, idx_pp, PER_PAGE, timeout_ms=2500)
         except Exception:
             pass
 
-        # NON includere aste passate (se checkbox presente)
         try:
-            cb = page.get_by_label(re.compile(r"Includi\s+le\s+aste\s+passate", re.I))
+            cb = form.get_by_label(re.compile(r"Includi\s+le\s+aste\s+passate", re.I))
             if cb.is_visible() and cb.is_checked():
                 cb.uncheck()
         except Exception:
             pass
 
-        # Click "Mostra il risultato"
-        clicked = False
-        for role in ("button", "link"):
-            try:
-                page.get_by_role(role, name=re.compile(r"Mostra\s+il\s+risultato", re.I)).first.click(timeout=5000)
-                clicked = True
-                break
-            except Exception:
-                continue
-        if not clicked:
-            page.get_by_text("Mostra il risultato", exact=False).first.click(timeout=5000)
+        _dismiss_iubenda(page)
+        submit = form.locator('input[type="submit"][value="Mostra il risultato"]').first
+        try:
+            submit.scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
 
-        # Attendi caricamento risultati
+        try:
+            submit.click(timeout=5000)
+        except Exception:
+            _dismiss_iubenda(page)
+            submit.click(timeout=5000, force=True)
+
         try:
             page.wait_for_load_state("networkidle", timeout=20000)
         except Exception:
             pass
+
         try:
             page.get_by_text(re.compile(r"\bTRIBUNALE\b", re.I)).first.wait_for(timeout=15000)
         except PlaywrightTimeoutError:
@@ -312,7 +381,6 @@ def scrape_for_comune(comune: str) -> List[Notice]:
         page_text = page.inner_text("body")
         blocks = _split_notices_from_page_text(page_text)
 
-        # fallback: prova a usare "LOTTO"
         if not blocks and "LOTTO" in page_text.upper():
             seg = _normalize_whitespace(page_text)
             blocks = re.split(r"\n(?=LOTTO\s+\w+)", seg)
@@ -325,11 +393,9 @@ def scrape_for_comune(comune: str) -> List[Notice]:
             header = b_norm.splitlines()[0] if b_norm else "Annuncio"
             sale_dt = _pick_sale_date(b_norm)
 
-            # Filtra attivi: se data rilevata nel passato, scarta
             if sale_dt is not None and sale_dt < date.today():
                 continue
 
-            # link nel testo
             urls = re.findall(r"(https?://\S+|www\.\S+)", b_norm)
             cleaned: List[str] = []
             for u in urls:
@@ -338,7 +404,6 @@ def scrape_for_comune(comune: str) -> List[Notice]:
                     u = "https://" + u
                 cleaned.append(u)
 
-            # arricchisci con link PVP presenti nella pagina
             pvp_links = [l for l in all_links if "portalevenditepubbliche" in l.lower()]
             linkset: List[str] = []
             for l in cleaned + pvp_links:
@@ -434,7 +499,7 @@ def send_email(subject: str, html_body: str) -> None:
         if not v
     ]
     if missing:
-        raise RuntimeError(f"Variabili d'ambiente mancanti per l'invio email: {', '.join(missing)}")
+        raise RuntimeError(f"Variabili d'ambiente mancanti per invio email: {', '.join(missing)}")
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -472,7 +537,6 @@ def main() -> int:
 
     subject, html_body = build_email_html(all_notices)
 
-    # Se non ci sono credenziali SMTP, stampa a video (debug)
     if os.getenv("SMTP_HOST") and os.getenv("SMTP_USER") and os.getenv("SMTP_PASS") and os.getenv("EMAIL_TO"):
         send_email(subject, html_body)
         print("Email inviata.")
