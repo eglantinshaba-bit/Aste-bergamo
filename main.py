@@ -20,7 +20,7 @@ TRIBUNALE_URL = "https://www.tribunale.bergamo.it/vendite-giudiziarie_164.html"
 REGIONE = "Lombardia"
 PROVINCIA = "Bergamo"
 
-COMUNI_TARGET = [
+COMUNI = [
     "Azzano San Paolo",
     "Stezzano",
     "Zanica",
@@ -29,7 +29,7 @@ COMUNI_TARGET = [
 ]
 
 ASTA_PER_PAGINA = "50"
-DEFAULT_TIMEOUT_MS = 35_000
+DEFAULT_TIMEOUT_MS = 45_000
 
 
 @dataclass(frozen=True)
@@ -38,8 +38,7 @@ class Notice:
     header: str
     body: str
     direct_link: str
-    links: Tuple[str, ...]
-    sale_date: Optional[date]
+    sale_date: str
 
 
 # -----------------------------
@@ -47,13 +46,6 @@ class Notice:
 # -----------------------------
 def log(msg: str) -> None:
     print(msg, flush=True)
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _strip_spaces(s: str) -> str:
@@ -141,83 +133,49 @@ def _resolve_final_url(url: str, timeout: int = 12) -> str:
         return u
 
 
-def _parse_sale_date(text: str) -> Optional[date]:
+def _extract_date_str(text: str) -> str:
     m = re.search(r"(\d{1,2})[./](\d{1,2})[./](\d{4})", text or "")
     if not m:
-        return None
-    dd, mm, yyyy = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    try:
-        return date(yyyy, mm, dd)
-    except Exception:
-        return None
-
-
-def _norm_place(s: str) -> str:
-    s = (s or "").lower()
-    s = s.replace(".", " ")
-    s = re.sub(r"[^a-z0-9 ]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    # san -> s, ecc
-    s = s.replace("s paolo", "san paolo")
-    return s
-
-
-COMUNI_REGEX = {
-    "Azzano San Paolo": re.compile(r"\bazzano\s+(san|s)\s+paolo\b", re.I),
-    "Stezzano": re.compile(r"\bstezzano\b", re.I),
-    "Zanica": re.compile(r"\bzanica\b", re.I),
-    "Lallio": re.compile(r"\blallio\b", re.I),
-    "Grassobio": re.compile(r"\bgrassobio\b", re.I),
-}
-
-
-def _match_comune(text: str) -> Optional[str]:
-    t = text or ""
-    for comune, rx in COMUNI_REGEX.items():
-        if rx.search(t):
-            return comune
-    return None
+        return "n/d"
+    return f"{int(m.group(1)):02d}/{int(m.group(2)):02d}/{m.group(3)}"
 
 
 def _score_link(href: str, ctx: str) -> int:
     h = (href or "").lower().strip()
     c = (ctx or "").lower().strip()
-
     if not h:
         return -1
     if h.startswith("mailto:") or h.startswith("tel:"):
         return -1
+    if "pdf-icon.png" in h:
+        return -1
 
     score = 0
-
-    # PDF = link più "diretto" per annuncio
     if ".pdf" in h:
-        score += 120
+        score += 200
         if "avviso" in c:
-            score += 30
+            score += 60
         if "perizia" in c:
-            score += 20
+            score += 40
         if "ordinanza" in c:
-            score += 10
+            score += 20
 
-    # PVP
     if "portalevenditepubbliche.giustizia.it" in h:
-        score += 90
+        score += 120
 
-    # tracking (decodifico)
     if "esvalabs.com" in h:
-        score += 60
+        score += 80
 
-    # dominio tribunale
     if "tribunale.bergamo.it" in h:
         score += 10
 
     return score
 
 
-def _pick_direct_link(links: List[Dict[str, str]]) -> str:
+def _pick_best_direct_link(links: List[Dict[str, str]]) -> str:
     best = ""
     best_score = -1
+
     for o in links:
         href = o.get("href", "")
         ctx = o.get("ctx", "")
@@ -225,15 +183,23 @@ def _pick_direct_link(links: List[Dict[str, str]]) -> str:
         if sc > best_score:
             best_score = sc
             best = href
-    return best or TRIBUNALE_URL
+
+    if not best:
+        return TRIBUNALE_URL
+
+    return _resolve_final_url(best)
 
 
 # -----------------------------
 # Playwright helpers
 # -----------------------------
 def _dismiss_cookie_banner(page) -> None:
+    """
+    Chiude banner Iubenda che blocca i click (intercepts pointer events).
+    """
     try:
-        page.wait_for_timeout(350)
+        page.wait_for_timeout(300)
+
         candidates = [
             'button:has-text("Accetta")',
             'button:has-text("Accetto")',
@@ -246,19 +212,20 @@ def _dismiss_cookie_banner(page) -> None:
             loc = page.locator(sel).first
             if loc.count() > 0:
                 try:
-                    loc.click(timeout=1200)
-                    page.wait_for_timeout(200)
+                    loc.click(timeout=1500, force=True)
+                    page.wait_for_timeout(250)
                     return
                 except Exception:
                     pass
 
+        # Fallback: rimuove overlay
         page.evaluate(
             """
             () => {
               const b = document.querySelector('#iubenda-cs-banner');
               if (b) b.remove();
-              const o = document.querySelector('.iubenda-cs-overlay');
-              if (o) o.remove();
+              const overlays = document.querySelectorAll('.iubenda-cs-overlay');
+              overlays.forEach(o => o.remove());
             }
             """
         )
@@ -275,71 +242,88 @@ def _active_form(page):
     return form
 
 
-def _select_after_label(form, label_text: str, desired: str) -> None:
+def _find_select_index_by_field_text(form, field_label: str) -> int:
     """
-    Seleziona option in un <select> che sta subito dopo il testo label_text dentro il form.
-    Fuzzy match su option text (per robustezza).
+    Trova il <select> giusto in base al testo contenuto nel wrapper vicino.
+    Serve per NON prendere "Ordina per" al posto di "Comune".
     """
-    # trova il nodo che contiene "Regione/Provincia/Aste per pagina"
-    lab = form.locator(
-        f"xpath=.//*[contains(normalize-space(.), '{label_text}')]"
-    ).first
+    return form.evaluate(
+        """
+        (f, fieldLabel) => {
+          const norm = (s) => (s || '').replace(/\\s+/g,' ').trim().toLowerCase();
+          const label = norm(fieldLabel);
 
-    if lab.count() == 0:
-        raise RuntimeError(f"Label '{label_text}' non trovata nel form.")
+          const selects = Array.from(f.querySelectorAll('select')).filter(s => {
+            const style = window.getComputedStyle(s);
+            const visible = style && style.display !== 'none' && style.visibility !== 'hidden' && s.offsetParent !== null;
+            return visible;
+          });
 
-    sel = lab.locator("xpath=following::select[1]").first
+          for (let i=0; i<selects.length; i++) {
+            const s = selects[i];
+            const wrap = s.closest('div') || s.closest('td') || s.parentElement;
+            const txt = norm(wrap ? wrap.innerText : '');
+            // deve contenere la label e NON essere "Ordina per"
+            if (txt.includes(label)) return i;
+          }
+          return -1;
+        }
+        """,
+        field_label,
+    )
+
+
+def _select_field_option(form, field_label: str, desired_value: str) -> None:
+    idx = _find_select_index_by_field_text(form, field_label)
+    if idx < 0:
+        raise RuntimeError(f"Impossibile trovare il select del campo '{field_label}' nel form attivo.")
+
+    sel = form.locator("select:visible").nth(idx)
     sel.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
 
-    # leggi opzioni
-    opts = sel.locator("option").all_text_contents()
-    opts_clean = [_strip_spaces(x) for x in opts if _strip_spaces(x)]
+    # Leggi opzioni reali
+    options = sel.locator("option").all_text_contents()
+    options_clean = [_strip_spaces(x) for x in options if _strip_spaces(x)]
 
-    desired_norm = _norm_place(desired)
+    desired_norm = _strip_spaces(desired_value).lower()
 
-    # match esatto
-    for o in opts_clean:
-        if o.lower() == desired.lower():
+    # Match esatto
+    for o in options_clean:
+        if o.lower() == desired_norm:
             sel.select_option(label=o)
             return
 
-    # match "contains"
-    best = None
-    for o in opts_clean:
-        if desired_norm in _norm_place(o):
-            best = o
-            break
+    # Match "contiene"
+    for o in options_clean:
+        if desired_norm in o.lower():
+            sel.select_option(label=o)
+            return
 
-    # fallback: token overlap
-    if best is None:
-        target_tokens = set(desired_norm.split())
-        best_score = -1
-        for o in opts_clean:
-            ot = set(_norm_place(o).split())
-            sc = len(target_tokens.intersection(ot))
-            if sc > best_score:
-                best_score = sc
-                best = o
+    # Fallback token overlap
+    target_tokens = set(desired_norm.split())
+    best = None
+    best_score = -1
+    for o in options_clean:
+        ot = set(o.lower().split())
+        sc = len(target_tokens.intersection(ot))
+        if sc > best_score:
+            best_score = sc
+            best = o
 
     if not best:
-        raise RuntimeError(f"Impossibile selezionare '{desired}' per '{label_text}'. Opzioni viste: {opts_clean[:12]}")
+        raise RuntimeError(f"Impossibile selezionare '{desired_value}' su '{field_label}'. Opzioni viste: {options_clean[:15]}")
 
     sel.select_option(label=best)
 
 
 def _uncheck_include_past_if_present(page) -> None:
-    """
-    Se trova checkbox "Includi le aste passate", prova a disattivarla.
-    """
     try:
         cb = page.get_by_label("Includi le aste passate")
         if cb.count() > 0:
             try:
-                # se è checked, uncheck
                 if cb.is_checked():
                     cb.uncheck()
             except Exception:
-                # fallback JS
                 page.evaluate(
                     """
                     () => {
@@ -353,20 +337,51 @@ def _uncheck_include_past_if_present(page) -> None:
         pass
 
 
+def _setup_base_filters(page) -> None:
+    page.goto(TRIBUNALE_URL, wait_until="domcontentloaded")
+    _dismiss_cookie_banner(page)
+
+    # Beni Immobili + Ricerca Generale
+    page.get_by_text("Beni Immobili", exact=False).first.click(timeout=DEFAULT_TIMEOUT_MS)
+    page.wait_for_timeout(300)
+    page.get_by_text("Ricerca Generale", exact=False).first.click(timeout=DEFAULT_TIMEOUT_MS)
+    page.wait_for_timeout(500)
+
+    _dismiss_cookie_banner(page)
+
+    form = _active_form(page)
+
+    _select_field_option(form, "Regione", REGIONE)
+    page.wait_for_timeout(600)
+
+    _select_field_option(form, "Provincia", PROVINCIA)
+    page.wait_for_timeout(900)
+
+    # Comune verrà scelto per ogni run
+    try:
+        _select_field_option(form, "Aste per pagina", ASTA_PER_PAGINA)
+        page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+    _uncheck_include_past_if_present(page)
+    _dismiss_cookie_banner(page)
+
+
 def _click_mostra_risultato(page) -> None:
     _dismiss_cookie_banner(page)
     btn = page.locator('input[type="submit"][value="Mostra il risultato"]:visible').first
     btn.click(timeout=DEFAULT_TIMEOUT_MS, force=True)
 
 
-def _wait_results(page) -> None:
-    page.wait_for_timeout(700)
-    # aspetta che compaia almeno un "TRIBUNALE" dopo la ricerca
+def _wait_results_or_empty(page) -> None:
+    page.wait_for_timeout(800)
+    # Aspetta o un annuncio (LOTTO) o messaggio "nessun"
     page.wait_for_function(
         """
         () => {
-          const t = document.body ? document.body.innerText.toUpperCase() : '';
-          return t.includes('TRIBUNALE') && t.includes('LOTTO');
+          const t = (document.body && document.body.innerText || '').toLowerCase();
+          return t.includes('lotto') || t.includes('nessun') || t.includes('nessuna');
         }
         """,
         timeout=DEFAULT_TIMEOUT_MS,
@@ -375,16 +390,16 @@ def _wait_results(page) -> None:
 
 def _extract_blocks(page) -> List[Dict]:
     """
-    Estrae annunci in blocchi:
-    - header: "TRIBUNALE ... LOTTO ..."
-    - body: righe descrizione
-    - links: a[href] presenti nel blocco
-    Ignora tutto quello dentro form/header/nav/footer.
+    Estrae annunci come blocchi delimitati da header:
+    "TRIBUNALE DI ... LOTTO ..."
+    e raccoglie link presenti nel blocco.
     """
     js = r"""
     () => {
       const norm = (s) => (s || '').replace(/\s+/g,' ').trim();
-      const isIgnored = (el) => {
+      const U = (s) => norm(s).toUpperCase();
+
+      const ignored = (el) => {
         if (!el) return true;
         if (el.closest('form')) return true;
         if (el.closest('header')) return true;
@@ -394,33 +409,29 @@ def _extract_blocks(page) -> List[Dict]:
       };
 
       const isHeader = (el) => {
-        if (!el) return false;
-        if (isIgnored(el)) return false;
+        if (!el || ignored(el)) return false;
         const t = norm(el.innerText);
         if (!t) return false;
-        const tu = t.toUpperCase();
+        const tu = U(t);
         if (!tu.startsWith('TRIBUNALE')) return false;
-        if (tu.length > 220) return false;
-        // deve sembrare annuncio (lotto / n. / rg)
-        if (!(tu.includes('LOTTO') || tu.includes('N.') || tu.includes('N°') || tu.includes('RG'))) return false;
+        if (!tu.includes('LOTTO')) return false;
+        if (tu.length > 250) return false;
         return true;
       };
 
-      // trova tutti i possibili header
       const all = Array.from(document.querySelectorAll('body *'));
       const headers = all.filter(isHeader);
       if (!headers.length) return [];
 
       const headerSet = new Set(headers);
-
-      // treewalker in ordine documento
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+
       const blocks = [];
       let current = null;
 
       const push = () => {
         if (!current) return;
-        // dedup links
+        // dedup link href
         const seen = new Set();
         current.links = current.links.filter(o => {
           const h = (o.href || '').trim();
@@ -429,7 +440,6 @@ def _extract_blocks(page) -> List[Dict]:
           seen.add(h);
           return true;
         });
-        // compatta testo
         current.body = norm(current.textParts.join('\n'));
         delete current.textParts;
         blocks.push(current);
@@ -437,33 +447,31 @@ def _extract_blocks(page) -> List[Dict]:
 
       let node;
       while (node = walker.nextNode()) {
-        if (isIgnored(node)) continue;
+        if (ignored(node)) continue;
 
         if (headerSet.has(node)) {
           push();
           current = { header: norm(node.innerText), textParts: [], links: [] };
           continue;
         }
-
         if (!current) continue;
 
-        // testo descrizione
         const tag = (node.tagName || '').toUpperCase();
         if (['P','DIV','LI'].includes(tag)) {
           const txt = norm(node.innerText);
-          if (txt && !txt.toUpperCase().startsWith('TRIBUNALE')) {
-            // evita di copiare 100 righe di menu
-            if (txt.length <= 2000) current.textParts.push(txt);
+          if (txt && !U(txt).startsWith('TRIBUNALE')) {
+            if (txt.length <= 2500) current.textParts.push(txt);
           }
         }
 
-        // link
+        // link: prendi href + contesto
         const anchors = node.querySelectorAll ? Array.from(node.querySelectorAll('a[href]')) : [];
         anchors.forEach(a => {
           const href = a.href || a.getAttribute('href') || '';
           if (!href) return;
-          const ctx = norm((a.closest('td') && a.closest('td').innerText) ? a.closest('td').innerText : (a.parentElement ? a.parentElement.innerText : a.innerText));
-          current.links.push({ href, ctx });
+          const ctx = norm(a.innerText || a.title || a.getAttribute('aria-label') || (a.parentElement ? a.parentElement.innerText : ''));
+          const onclick = a.getAttribute('onclick') || '';
+          current.links.push({ href, ctx, onclick });
         });
       }
 
@@ -471,45 +479,11 @@ def _extract_blocks(page) -> List[Dict]:
       return blocks;
     }
     """
-    blocks = page.evaluate(js)
-    return blocks or []
+    return page.evaluate(js) or []
 
 
-def _setup_search(page) -> None:
-    page.goto(TRIBUNALE_URL, wait_until="domcontentloaded")
-    _dismiss_cookie_banner(page)
-
-    # Beni Immobili + Ricerca Generale
-    page.get_by_text("Beni Immobili", exact=False).first.click(timeout=DEFAULT_TIMEOUT_MS)
-    page.wait_for_timeout(300)
-    page.get_by_text("Ricerca Generale", exact=False).first.click(timeout=DEFAULT_TIMEOUT_MS)
-    page.wait_for_timeout(400)
-
-    _dismiss_cookie_banner(page)
-
-    form = _active_form(page)
-
-    # Regione / Provincia / per pagina
-    _select_after_label(form, "Regione", REGIONE)
-    page.wait_for_timeout(600)
-
-    _select_after_label(form, "Provincia", PROVINCIA)
-    page.wait_for_timeout(900)
-
-    try:
-        _select_after_label(form, "Aste per pagina", ASTA_PER_PAGINA)
-    except Exception:
-        pass
-
-    _uncheck_include_past_if_present(page)
-
-    _dismiss_cookie_banner(page)
-    _click_mostra_risultato(page)
-    _wait_results(page)
-
-
-def scrape_all_for_province() -> List[Notice]:
-    headless = _env_bool("HEADLESS", True)
+def scrape_for_comune(comune: str) -> List[Notice]:
+    headless = (os.getenv("HEADLESS", "1").strip().lower() not in {"0", "false", "no"})
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -517,50 +491,58 @@ def scrape_all_for_province() -> List[Notice]:
         page.set_default_timeout(DEFAULT_TIMEOUT_MS)
 
         try:
-            _setup_search(page)
+            _setup_base_filters(page)
+            form = _active_form(page)
+
+            # Seleziona Comune (quello vero)
+            _select_field_option(form, "Comune", comune)
+            page.wait_for_timeout(500)
+
+            _click_mostra_risultato(page)
+            _wait_results_or_empty(page)
+
+            page_text = (page.inner_text("body") or "").lower()
+            if "nessun" in page_text and "lotto" not in page_text:
+                return []
 
             blocks = _extract_blocks(page)
-            notices: List[Notice] = []
 
+            notices: List[Notice] = []
             for b in blocks:
                 header = _strip_spaces(b.get("header") or "")
                 body = _strip_spaces(b.get("body") or "")
+                sale_date = _extract_date_str(header + " " + body)
 
-                # comune trovato in header+body
-                comune = _match_comune(header + " " + body)
-                if not comune:
-                    continue
-
-                links_raw = b.get("links") or []
+                raw_links = b.get("links") or []
                 links: List[Dict[str, str]] = []
-                for o in links_raw:
+                for o in raw_links:
                     href = _normalize_url(o.get("href", ""))
                     if not href:
                         continue
                     ctx = _strip_spaces(o.get("ctx", ""))
+
+                    # se href è solo l’icona pdf, prova a tirar fuori url dal onclick
+                    if "pdf-icon.png" in href.lower():
+                        onclick = (o.get("onclick") or "")
+                        m = re.search(r"(https?://[^'\" ]+)", onclick)
+                        if m:
+                            href = m.group(1).strip()
+                        else:
+                            m2 = re.search(r"(/[^'\" ]+\.pdf[^'\" ]*)", onclick)
+                            if m2:
+                                href = "https://www.tribunale.bergamo.it" + m2.group(1).strip()
+
                     links.append({"href": href, "ctx": ctx})
 
-                direct_raw = _pick_direct_link(links)
-                direct = _resolve_final_url(direct_raw)
-
-                # data vendita (se presente)
-                sale_dt = _parse_sale_date(header + " " + body)
-                # escludi aste passate
-                if sale_dt is not None and sale_dt < date.today():
-                    continue
-
-                # limita body per email
-                if len(body) > 3200:
-                    body = body[:3200] + "…"
+                direct = _pick_best_direct_link(links)
 
                 notices.append(
                     Notice(
                         comune=comune,
                         header=header or "Annuncio",
-                        body=body,
+                        body=body[:3500] + ("…" if len(body) > 3500 else ""),
                         direct_link=direct or TRIBUNALE_URL,
-                        links=tuple([x["href"] for x in links][:10]),
-                        sale_date=sale_dt,
+                        sale_date=sale_date,
                     )
                 )
 
@@ -573,26 +555,18 @@ def scrape_all_for_province() -> List[Notice]:
 # -----------------------------
 # Email
 # -----------------------------
-def build_email_html(all_notices: List[Notice]) -> Tuple[str, str]:
+def build_email_html(results: Dict[str, List[Notice]]) -> Tuple[str, str]:
     today = date.today().strftime("%d/%m/%Y")
-    subject = f"Aste giudiziarie attive (BG) - report {today}"
-
-    by_comune: Dict[str, List[Notice]] = {c: [] for c in COMUNI_TARGET}
-    for n in all_notices:
-        if n.comune in by_comune:
-            by_comune[n.comune].append(n)
-
-    for c in by_comune:
-        by_comune[c].sort(key=lambda x: (x.sale_date or date.max, x.header))
+    subject = f"Aste Tribunale Bergamo – Annunci attivi ({today})"
 
     html = []
     html.append("<html><body style='font-family:Arial,Helvetica,sans-serif'>")
     html.append(f"<h2>{subject}</h2>")
-    html.append("<p><b>Fonte:</b> Tribunale di Bergamo – Vendite Giudiziarie</p>")
+    html.append("<p><b>Fonte:</b> tribunale.bergamo.it → Vendite Giudiziarie</p>")
 
     total = 0
-    for comune in COMUNI_TARGET:
-        lst = by_comune.get(comune, [])
+    for comune in COMUNI:
+        lst = results.get(comune, [])
         html.append(f"<h3>{comune} ({len(lst)})</h3>")
 
         if not lst:
@@ -602,24 +576,16 @@ def build_email_html(all_notices: List[Notice]) -> Tuple[str, str]:
         html.append("<ul>")
         for n in lst:
             total += 1
-            sale = n.sale_date.strftime("%d/%m/%Y") if n.sale_date else "n/d"
-            html.append("<li style='margin-bottom:16px'>")
-            html.append(f"<b>{n.header}</b> – <span>Data vendita: {sale}</span><br>")
-
-            html.append(
-                f"<div style='margin-top:6px'>"
-                f"<b>LINK DIRETTO:</b> "
-                f"<a href='{n.direct_link}'>{n.direct_link}</a>"
-                f"</div>"
-            )
-
+            html.append("<li style='margin-bottom:18px'>")
+            html.append(f"<b>{n.header}</b><br>")
+            html.append(f"<span>Data vendita: <b>{n.sale_date}</b></span><br>")
+            html.append(f"<div style='margin-top:6px'><b>LINK DIRETTO:</b> <a href='{n.direct_link}'>{n.direct_link}</a></div>")
             if n.body:
                 html.append(f"<div style='margin-top:8px;color:#222'>{n.body}</div>")
-
             html.append("</li>")
         html.append("</ul>")
 
-    html.append(f"<hr><p>Totale annunci attivi trovati: <b>{total}</b></p>")
+    html.append(f"<hr><p>Totale annunci trovati: <b>{total}</b></p>")
     html.append("</body></html>")
 
     return subject, "".join(html)
@@ -651,34 +617,40 @@ def send_email(subject: str, html_body: str) -> None:
 # Main
 # -----------------------------
 def main() -> int:
-    try:
-        notices = scrape_all_for_province()
-        log(f"Totale annunci filtrati sui comuni target: {len(notices)}")
-    except Exception as e:
-        tb = traceback.format_exc()
-        notices = [
-            Notice(
-                comune="ERRORE",
-                header="ERRORE GENERALE SCRAPING",
-                body=f"{e}\n\n{tb}",
-                direct_link=TRIBUNALE_URL,
-                links=(TRIBUNALE_URL,),
-                sale_date=None,
-            )
-        ]
+    results: Dict[str, List[Notice]] = {}
 
-    subject, html_body = build_email_html(notices)
+    for comune in COMUNI:
+        try:
+            log(f"Scraping comune: {comune}")
+            results[comune] = scrape_for_comune(comune)
+            log(f" -> trovati: {len(results[comune])}")
+        except Exception as e:
+            tb = traceback.format_exc()
+            log(f"ERRORE scraping {comune}: {e}")
+            results[comune] = [
+                Notice(
+                    comune=comune,
+                    header=f"ERRORE scraping per {comune}",
+                    body=f"{e}\n\n{tb}",
+                    direct_link=TRIBUNALE_URL,
+                    sale_date="n/d",
+                )
+            ]
 
+    subject, html = build_email_html(results)
+
+    # invio mail (se configurato)
     if os.getenv("SMTP_HOST") and os.getenv("SMTP_USER") and os.getenv("SMTP_PASS") and os.getenv("EMAIL_TO"):
-        send_email(subject, html_body)
+        send_email(subject, html)
         log("Email inviata.")
     else:
+        log("SMTP non configurato: stampo risultati a console.")
         print(subject)
-        print("=" * len(subject))
-        for n in notices[:20]:
-            print(f"\n[{n.comune}] {n.header} (data={n.sale_date})")
-            print(f"LINK: {n.direct_link}")
-            print(n.body[:500])
+        for c, lst in results.items():
+            print(f"\n{c} ({len(lst)})")
+            for n in lst[:3]:
+                print(" -", n.header)
+                print("   LINK:", n.direct_link)
 
     return 0
 
