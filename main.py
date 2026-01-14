@@ -1,41 +1,47 @@
 """
 Aste Bergamo - Scraper "Vendite Giudiziarie" (Tribunale di Bergamo)
 
-Fix principali (v3):
-- Gestione robusta del banner cookie Iubenda che intercetta i click (iubenda-cs-banner)
-- Operazioni (select/click) eseguite SOLO nel form "attivo" (quello che contiene "Mostra il risultato")
-- Provincia bloccata su Bergamo
-- Comuni target: Azzano San Paolo, Stezzano, Zanica, Lallio, Grassobio
-- Per ogni annuncio: LINK DIRETTO (priorità a PVP/Giustizia/esvalabs) + lista link trovati nel testo
+Obiettivo:
+- Aprire https://www.tribunale.bergamo.it/vendite-giudiziarie_164.html
+- Selezionare:
+  - Beni Immobili
+  - Ricerca Generale
+  - Regione: Lombardia
+  - Provincia: Bergamo
+  - Comune: (lista target)
+- Estrarre TUTTI gli annunci attivi e inviare una mail con:
+  - Comune
+  - Titolo annuncio
+  - Testo annuncio (sintesi)
+  - Link diretto (priorità PDF Avviso/Perizia)
+  - (opzionale) altri link
 
-ENV richieste per invio email (SMTP):
-  SMTP_HOST     es. smtp.gmail.com
-  SMTP_PORT     es. 587
-  SMTP_USER     es. account@gmail.com
-  SMTP_PASS     (Gmail: App Password)
-  EMAIL_TO      destinatario (es. eglantinshaba@gmail.com)
+Nota:
+Il sito usa un banner cookie (Iubenda) che può bloccare i click.
+Lo script lo gestisce in automatico.
 
-ENV opzionali:
-  HEADLESS=1/0  (default 1)
-  DEBUG=1/0     (default 0)
+Repo-ready per GitHub Actions.
 """
 
 from __future__ import annotations
 
 import os
 import re
-import sys
-import ssl
 import smtplib
+import traceback
 from dataclasses import dataclass
-from datetime import datetime, date
-from email.message import EmailMessage
-from typing import List, Optional, Tuple
+from datetime import date
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, unquote, urlparse
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError  # type: ignore
+import requests
+from playwright.sync_api import sync_playwright
 
 
 TRIBUNALE_URL = "https://www.tribunale.bergamo.it/vendite-giudiziarie_164.html"
+
 REGIONE = "Lombardia"
 PROVINCIA = "Bergamo"
 
@@ -47,7 +53,8 @@ COMUNI_TARGET = [
     "Grassobio",
 ]
 
-PER_PAGE = "50"
+ASTA_PER_PAGINA = "50"  # 10 / 25 / 50
+DEFAULT_TIMEOUT_MS = 30_000
 
 
 @dataclass(frozen=True)
@@ -60,6 +67,13 @@ class Notice:
     sale_date: Optional[date]
 
 
+# -----------------------------
+# Utils
+# -----------------------------
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None:
@@ -67,475 +81,587 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return v.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-DEBUG = _env_bool("DEBUG", False)
-HEADLESS = _env_bool("HEADLESS", True)
+def _strip_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
 
 
-def log(msg: str) -> None:
-    if DEBUG:
-        print(f"[DEBUG] {msg}", file=sys.stderr)
+def _normalize_url(url: str) -> str:
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if u.startswith("//"):
+        return "https:" + u
+    if u.startswith("/"):
+        return "https://www.tribunale.bergamo.it" + u
+    if u.startswith("www."):
+        return "https://" + u
+    return u
 
 
-def _normalize_whitespace(s: str) -> str:
-    s = s.replace("\xa0", " ")
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
+def _try_extract_real_url_from_tracking(url: str) -> str:
+    """
+    Decodifica i link 'urlsand.esvalabs.com' che includono la vera URL nel parametro 'u='.
+    """
+    u = (url or "").strip()
+    if not u:
+        return u
+
+    try:
+        p = urlparse(u)
+        host = (p.netloc or "").lower()
+        if "esvalabs.com" not in host:
+            return u
+
+        qs = parse_qs(p.query or "")
+        if "u" not in qs or not qs["u"]:
+            return u
+
+        raw = qs["u"][0]
+        decoded = raw
+        for _ in range(4):
+            decoded = unquote(decoded)
+
+        m = re.search(r"(https?://[^ \n\r\t]+)", decoded)
+        if not m:
+            return u
+
+        candidate = m.group(1).strip()
+
+        # se contiene più "http://", prendi l’ultimo
+        http_positions = [m.start() for m in re.finditer(r"https?://", candidate)]
+        if len(http_positions) >= 2:
+            candidate = candidate[http_positions[-1] :]
+
+        if "portalevenditepubbliche.giustizia.it" in candidate:
+            return candidate
+
+        return candidate
+    except Exception:
+        return u
 
 
-_DATE_PATTERNS = [
-    re.compile(r"\b(\d{1,2})[./](\d{1,2})[./](\d{4})\b"),
-]
+def _resolve_final_url(url: str, timeout: int = 10) -> str:
+    """
+    Restituisce un link "diretto" e stabile.
+    1) Se è tracking esvalabs -> decodifica e restituisce l'URL reale (senza fare richieste).
+    2) Altrimenti segue redirect HTTP.
+    """
+    u = _normalize_url(url)
+    if not u:
+        return ""
+
+    decoded = _try_extract_real_url_from_tracking(u)
+    if decoded and decoded != u:
+        return decoded
+
+    try:
+        r = requests.get(
+            u,
+            allow_redirects=True,
+            timeout=timeout,
+            stream=True,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        final_url = str(r.url) or u
+        r.close()
+        return final_url
+    except Exception:
+        return u
 
 
-def _extract_dates(text: str) -> List[date]:
-    found: List[date] = []
-    for rx in _DATE_PATTERNS:
-        for m in rx.finditer(text):
-            d, mth, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            try:
-                found.append(date(y, mth, d))
-            except ValueError:
-                continue
-    out: List[date] = []
+def _looks_like_pdf(url: str, text: str) -> bool:
+    hl = (url or "").lower()
+    tl = (text or "").lower()
+
+    if ".pdf" in hl:
+        return True
+    if "pdf" in hl and any(k in hl for k in ["file=", "download", "doc", "alleg", "attach"]):
+        return True
+    if any(k in tl for k in ["avviso vendita", "avviso", "perizia", "autorizzazione gd"]):
+        return True
+    return False
+
+
+def _score_link(href: str, text: str) -> int:
+    h = (href or "").strip()
+    t = (text or "").strip()
+    if not h:
+        return -1
+
+    hl = h.lower()
+    tl = t.lower()
+
+    if hl.startswith("mailto:") or hl.startswith("tel:"):
+        return -1
+    if any(hl.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico"]):
+        return -1
+
+    score = 0
+
+    # 1) PDF (Avviso/Perizia) = top
+    if _looks_like_pdf(h, t):
+        score += 120
+        if "avviso" in tl:
+            score += 25
+        if "perizia" in tl:
+            score += 15
+        if "autorizzazione" in tl:
+            score += 10
+
+    # 2) PVP
+    if "portalevenditepubbliche.giustizia.it" in hl:
+        score += 90
+
+    # 3) tracking (lo decodifichiamo)
+    if "esvalabs.com" in hl:
+        score += 60
+
+    # 4) dettagli / lotto
+    if any(k in tl for k in ["dettaglio", "scheda", "procedura", "lotto"]):
+        score += 20
+    if any(k in hl for k in ["vendite", "asta", "lotto", "procedura"]):
+        score += 15
+
+    # 5) dominio tribunale
+    if "tribunale.bergamo.it" in hl:
+        score += 10
+
+    return score
+
+
+def _pick_direct_link(link_objs: List[Dict[str, str]]) -> str:
+    best_href = ""
+    best_score = -1
+    for obj in link_objs:
+        href = (obj.get("href") or "").strip()
+        text = (obj.get("text") or "").strip()
+        sc = _score_link(href, text)
+        if sc > best_score:
+            best_score = sc
+            best_href = href
+    return best_href or TRIBUNALE_URL
+
+
+def _flatten_links(link_objs: List[Dict[str, str]]) -> List[str]:
+    out: List[str] = []
     seen = set()
-    for d in found:
-        if d not in seen:
-            out.append(d)
-            seen.add(d)
+    for o in link_objs:
+        h = _normalize_url(o.get("href") or "")
+        if not h:
+            continue
+        if h not in seen:
+            seen.add(h)
+            out.append(h)
     return out
 
 
-def _pick_sale_date(block_text: str) -> Optional[date]:
-    dates = _extract_dates(block_text)
-    if not dates:
-        return None
-    today = date.today()
-    future = [d for d in dates if d >= today]
-    if future:
-        return min(future)
-    return max(dates)
-
-
-def _split_notices_from_page_text(page_text: str) -> List[str]:
-    text = _normalize_whitespace(page_text)
-    start = text.find("TRIBUNALE")
-    if start == -1:
-        return []
-    end = text.find("Il Tribunale", start)
-    if end != -1:
-        text = text[start:end].strip()
-    else:
-        text = text[start:].strip()
-
-    blocks = re.split(r"\n(?=TRIBUNALE\s+DI\s+)", text)
-    blocks = [b.strip() for b in blocks if b.strip().startswith("TRIBUNALE")]
-    return blocks
-
-
-def _dismiss_iubenda(page, timeout_ms: int = 4000) -> None:
+# -----------------------------
+# Playwright helpers
+# -----------------------------
+def _dismiss_cookie_banner(page) -> None:
     """
-    Se presente il banner cookie Iubenda (id=iubenda-cs-banner) lo chiude/clicca.
-    Se non riesce, lo nasconde (fallback) così non intercetta i click.
+    Accetta/chiude Iubenda (cookie banner) + fallback JS remove overlay.
     """
     try:
-        banner = page.locator("#iubenda-cs-banner")
-        banner.wait_for(state="visible", timeout=timeout_ms)
-    except Exception:
-        return
+        page.wait_for_timeout(600)
 
-    try:
-        banner = page.locator("#iubenda-cs-banner")
-        if not banner.is_visible():
-            return
-    except Exception:
-        return
+        candidates = [
+            'button:has-text("Accetta")',
+            'button:has-text("Accetto")',
+            'button:has-text("Accetta tutto")',
+            'button:has-text("Accetta tutti")',
+            'button:has-text("Accept")',
+            'button:has-text("Allow")',
+            '[data-iubenda-cs="accept-btn"]',
+            ".iubenda-cs-accept-btn",
+            "#iubenda-cs-banner button",
+        ]
 
-    candidates = [
-        "#iubenda-cs-accept-btn",
-        ".iubenda-cs-accept-btn",
-        "button:has-text('Accetta')",
-        "a:has-text('Accetta')",
-        "#iubenda-cs-reject-btn",
-        ".iubenda-cs-reject-btn",
-        "button:has-text('Rifiuta')",
-        "a:has-text('Rifiuta')",
-        ".iubenda-cs-close-btn",
-        "button:has-text('Chiudi')",
-        "button:has-text('Continua senza accettare')",
-        "a:has-text('Continua senza accettare')",
-        "button:has-text('OK')",
-    ]
+        for sel in candidates:
+            loc = page.locator(sel).first
+            if loc.count() > 0:
+                try:
+                    loc.click(timeout=1500)
+                    page.wait_for_timeout(350)
+                    return
+                except Exception:
+                    pass
 
-    for sel in candidates:
-        try:
-            btn = banner.locator(sel).first
-            btn.wait_for(state="visible", timeout=1200)
-            btn.click(timeout=1200)
-            page.wait_for_timeout(300)
-            if page.locator("#iubenda-cs-banner").count() == 0:
-                return
-            if not page.locator("#iubenda-cs-banner").is_visible():
-                return
-        except Exception:
-            continue
-
-    # fallback: nasconde overlay
-    try:
         page.evaluate(
-            """() => {
-                const b = document.querySelector('#iubenda-cs-banner');
-                if (b) {
-                  b.style.pointerEvents = 'none';
-                  b.style.display = 'none';
-                }
-            }"""
+            """
+            () => {
+              const el = document.querySelector('#iubenda-cs-banner');
+              if (el) el.remove();
+              const o = document.querySelector('.iubenda-cs-overlay');
+              if (o) o.remove();
+            }
+            """
         )
     except Exception:
         pass
 
 
-def _get_visible_submit(page):
-    subs = page.locator('input[type="submit"][value="Mostra il risultato"]')
-    for i in range(subs.count()):
-        s = subs.nth(i)
-        try:
-            if s.is_visible():
-                return s
-        except Exception:
-            continue
-    raise RuntimeError("Impossibile trovare il pulsante 'Mostra il risultato' visibile.")
+def _smart_select_option(page, label_text: str, value_text: str) -> None:
+    """
+    Seleziona value_text in un <select> associato a label_text.
+    Fallback: cerca il select che contiene l’opzione richiesta.
+    """
+    value_text = value_text.strip()
 
-
-def _get_active_form(page):
-    submit = _get_visible_submit(page)
-    form = submit.locator("xpath=ancestor::form[1]")
-    if form.count() == 0:
-        raise RuntimeError("Impossibile risalire al form dal pulsante 'Mostra il risultato'.")
-    return form
-
-
-def _find_visible_select_index_by_options(scope, must_contain: List[str], timeout_ms: int = 8000) -> int:
-    must = [m.lower() for m in must_contain]
-    selects = scope.locator("select")
-    count = selects.count()
-    deadline = datetime.now().timestamp() + (timeout_ms / 1000)
-
-    while datetime.now().timestamp() < deadline:
-        for i in range(count):
-            try:
-                sel = selects.nth(i)
-                if not sel.is_visible():
-                    continue
-                options_text: str = sel.evaluate(
-                    """(el) => Array.from(el.options || []).map(o => (o.textContent||"").trim()).join("\\n")"""
-                )
-                ot = options_text.lower()
-                if all(m in ot for m in must):
-                    return i
-            except Exception:
-                continue
-        scope.page.wait_for_timeout(250)
-
-    raise RuntimeError(f"Impossibile trovare <select> visibile con opzioni {must_contain}.")
-
-
-def _select_option_by_label(scope, select_nth: int, label: str, timeout_ms: int = 10000) -> None:
-    sel = scope.locator("select").nth(select_nth)
-    deadline = datetime.now().timestamp() + (timeout_ms / 1000)
-    last_err: Optional[str] = None
-    while datetime.now().timestamp() < deadline:
-        try:
-            sel.select_option(label=label)
+    # 1) prova per label
+    try:
+        sel = page.get_by_label(label_text)
+        if sel.count() > 0:
+            sel.select_option(label=value_text, timeout=DEFAULT_TIMEOUT_MS)
             return
-        except Exception as e:
-            last_err = str(e)
-            scope.page.wait_for_timeout(250)
-    raise RuntimeError(f"Impossibile selezionare '{label}' sul select #{select_nth}. Errore: {last_err}")
+    except Exception:
+        pass
 
-
-def _wait_select_has_option(scope, select_nth: int, label: str, timeout_ms: int = 12000) -> None:
-    sel = scope.locator("select").nth(select_nth)
-    deadline = datetime.now().timestamp() + (timeout_ms / 1000)
-    while datetime.now().timestamp() < deadline:
+    # 2) cerca tra tutti i select visibili
+    selects = page.locator("select:visible")
+    for i in range(selects.count()):
+        s = selects.nth(i)
         try:
-            ok: bool = sel.evaluate(
-                """(el, val) => Array.from(el.options || []).some(o => (o.textContent||"").trim() === val)""",
-                label,
-            )
-            if ok:
+            options = s.locator("option").all_text_contents()
+            if any(value_text.lower() == (o or "").strip().lower() for o in options):
+                s.select_option(label=value_text, timeout=DEFAULT_TIMEOUT_MS)
                 return
         except Exception:
-            pass
-        scope.page.wait_for_timeout(250)
-    raise RuntimeError(f"Timeout: l'opzione '{label}' non è comparsa nel select #{select_nth}.")
+            continue
+
+    raise RuntimeError(f"Impossibile trovare <select> visibile con opzioni [{value_text}]")
+
+
+def _click_mostra_risultato(page) -> None:
+    btn = page.locator('input[type="submit"][value="Mostra il risultato"]').first
+    btn.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+    _dismiss_cookie_banner(page)
+    btn.click(timeout=DEFAULT_TIMEOUT_MS, force=True)
+
+
+def _wait_results_loaded(page) -> None:
+    page.wait_for_timeout(500)
+    page.wait_for_function(
+        """
+        () => {
+          const txt = document.body && document.body.innerText ? document.body.innerText : '';
+          return txt.toUpperCase().includes('TRIBUNALE DI ');
+        }
+        """,
+        timeout=DEFAULT_TIMEOUT_MS,
+    )
+
+
+def _extract_blocks_from_page(page) -> List[Dict]:
+    """
+    Raggruppa blocchi da "TRIBUNALE DI ..." fino al successivo.
+    Raccoglie:
+    - <a href>
+    - URL dentro onclick / data-url / data-href
+    """
+    js = r"""
+    () => {
+      const root = document.body;
+      if (!root) return [];
+
+      const norm = (s) => (s || '').replace(/\s+/g,' ').trim();
+
+      const extractUrlsFromString = (s) => {
+        const out = [];
+        if (!s) return out;
+        // URL complete e path relativi PDF
+        const re = /((https?:\/\/)[^'"\s<>]+)|((\/)[^'"\s<>]+(\.pdf|\.PDF))/g;
+        let m;
+        while ((m = re.exec(s)) !== null) {
+          const u = m[0];
+          if (!u) continue;
+          out.push(u);
+        }
+        if (s.includes('portalevenditepubbliche.giustizia.it')) {
+          out.push('https://www.portalevenditepubbliche.giustizia.it');
+        }
+        return out;
+      };
+
+      const isTitle = (el) => {
+        if (!el) return false;
+        const t = norm(el.innerText);
+        if (!t) return false;
+        const tu = t.toUpperCase();
+        if (!tu.startsWith('TRIBUNALE DI ')) return false;
+        if (t.length > 140) return false;
+        return true;
+      };
+
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+      const titles = [];
+      let node;
+      while (node = walker.nextNode()) {
+        if (isTitle(node)) titles.push(node);
+      }
+      if (!titles.length) return [];
+
+      const titleSet = new Set(titles);
+
+      const walker2 = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+      const blocks = [];
+      let current = null;
+
+      const pushCurrent = () => {
+        if (!current) return;
+        const body = norm(current.textParts.join('\n'));
+        blocks.push({ header: current.header, body, links: current.links });
+      };
+
+      while (node = walker2.nextNode()) {
+
+        if (titleSet.has(node)) {
+          pushCurrent();
+          current = { header: norm(node.innerText), textParts: [], links: [] };
+          continue;
+        }
+
+        if (!current) continue;
+
+        // <a href>
+        if ((node.tagName || '').toUpperCase() === 'A') {
+          const href = node.href || node.getAttribute('href') || '';
+          if (href) {
+            current.links.push({ href: href, text: norm(node.innerText) || norm(node.getAttribute('title')) });
+          }
+          const onclick = node.getAttribute('onclick') || '';
+          extractUrlsFromString(onclick).forEach(u => current.links.push({ href: u, text: norm(node.innerText) || 'Allegato' }));
+        }
+
+        // onclick / data-url anche su altri elementi
+        const onclick2 = node.getAttribute && node.getAttribute('onclick');
+        if (onclick2) {
+          extractUrlsFromString(onclick2).forEach(u => current.links.push({ href: u, text: 'Allegato' }));
+        }
+        const dataHref = node.getAttribute && (node.getAttribute('data-href') || node.getAttribute('data-url') || node.getAttribute('data-file'));
+        if (dataHref) {
+          current.links.push({ href: dataHref, text: 'Allegato' });
+        }
+
+        // testo utile
+        const tag = (node.tagName || '').toUpperCase();
+        if (['P','LI'].includes(tag)) {
+          const t = norm(node.innerText);
+          if (t && !t.toUpperCase().startsWith('TRIBUNALE DI ')) current.textParts.push(t);
+        }
+      }
+
+      pushCurrent();
+
+      // dedup links
+      blocks.forEach(b => {
+        const seen = new Set();
+        b.links = (b.links || []).filter(o => {
+          const h = (o.href || '').trim();
+          if (!h) return false;
+          if (seen.has(h)) return false;
+          seen.add(h);
+          return true;
+        });
+      });
+
+      return blocks;
+    }
+    """
+    blocks: List[Dict] = page.evaluate(js)
+    return blocks or []
+
+
+def _parse_sale_date(text: str) -> Optional[date]:
+    m = re.search(r"(\d{1,2})[./](\d{1,2})[./](\d{4})", text or "")
+    if not m:
+        return None
+    dd, mm, yyyy = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        return date(yyyy, mm, dd)
+    except Exception:
+        return None
 
 
 def scrape_for_comune(comune: str) -> List[Notice]:
-    notices: List[Notice] = []
+    headless = _env_bool("HEADLESS", True)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS)
-        context = browser.new_context()
-        page = context.new_page()
+        browser = p.chromium.launch(headless=headless)
+        page = browser.new_page()
+        page.set_default_timeout(DEFAULT_TIMEOUT_MS)
 
-        page.goto(TRIBUNALE_URL, wait_until="domcontentloaded", timeout=60000)
-        _dismiss_iubenda(page)
-
-        # tab "Beni Immobili" + "Ricerca Generale" (se serve)
         try:
-            page.get_by_text("Beni Immobili", exact=False).first.click(timeout=1500)
-        except Exception:
-            pass
-        try:
-            page.get_by_text("Ricerca Generale", exact=False).first.click(timeout=1500)
-        except Exception:
-            pass
+            page.goto(TRIBUNALE_URL, wait_until="domcontentloaded")
+            _dismiss_cookie_banner(page)
 
-        form = _get_active_form(page)
-
-        # Regione
-        idx_regione = _find_visible_select_index_by_options(form, [REGIONE, "Veneto"], timeout_ms=8000)
-        _select_option_by_label(form, idx_regione, REGIONE)
-
-        # Provincia (Bergamo)
-        idx_prov = _find_visible_select_index_by_options(form, [PROVINCIA], timeout_ms=12000)
-        _wait_select_has_option(form, idx_prov, PROVINCIA, timeout_ms=12000)
-        _select_option_by_label(form, idx_prov, PROVINCIA)
-
-        # Comune
-        comune_set = False
-        try:
-            idx_com = _find_visible_select_index_by_options(form, [comune], timeout_ms=15000)
-            _wait_select_has_option(form, idx_com, comune, timeout_ms=15000)
-            _select_option_by_label(form, idx_com, comune, timeout_ms=15000)
-            comune_set = True
-        except Exception as e:
-            log(f"Comune via <select> non riuscito ({comune}): {e}")
-
-        if not comune_set:
+            # TAB: Beni Immobili
             try:
-                inp = form.locator("input[id*='comun' i], input[name*='comun' i]").first
-                if inp.count() and inp.is_visible():
-                    inp.click(timeout=1000)
-                    inp.fill(comune, timeout=2000)
-                    inp.press("Enter", timeout=1500)
-                    comune_set = True
-            except Exception as e:
-                raise RuntimeError(f"Impossibile impostare il Comune '{comune}' (né select né input). Dettaglio: {e}")
+                page.get_by_role("link", name=re.compile(r"Beni\s+Immobili", re.I)).click(timeout=DEFAULT_TIMEOUT_MS)
+            except Exception:
+                page.get_by_text("Beni Immobili", exact=False).first.click(timeout=DEFAULT_TIMEOUT_MS)
 
-        # Aste per pagina
-        try:
-            idx_pp = _find_visible_select_index_by_options(form, ["10", "25", "50"], timeout_ms=2500)
-            _select_option_by_label(form, idx_pp, PER_PAGE, timeout_ms=2500)
-        except Exception:
-            pass
+            # SUBTAB: Ricerca Generale
+            try:
+                page.get_by_role("link", name=re.compile(r"Ricerca\s+Generale", re.I)).click(timeout=DEFAULT_TIMEOUT_MS)
+            except Exception:
+                page.get_by_text("Ricerca Generale", exact=False).first.click(timeout=DEFAULT_TIMEOUT_MS)
 
-        # disabilita aste passate se checkato
-        try:
-            cb = form.get_by_label(re.compile(r"Includi\s+le\s+aste\s+passate", re.I))
-            if cb.is_visible() and cb.is_checked():
-                cb.uncheck()
-        except Exception:
-            pass
+            _dismiss_cookie_banner(page)
 
-        _dismiss_iubenda(page)
+            # Regione / Provincia / Comune
+            _smart_select_option(page, "Regione", REGIONE)
+            page.wait_for_timeout(500)
+            _smart_select_option(page, "Provincia", PROVINCIA)
+            page.wait_for_timeout(900)
+            _smart_select_option(page, "Comune", comune)
 
-        # click mostra risultato (con fallback force)
-        submit = form.locator('input[type="submit"][value="Mostra il risultato"]').first
-        try:
-            submit.scroll_into_view_if_needed(timeout=2000)
-        except Exception:
-            pass
+            # Aste per pagina
+            try:
+                _smart_select_option(page, "Aste per pagina", ASTA_PER_PAGINA)
+            except Exception:
+                pass
 
-        try:
-            submit.click(timeout=5000)
-        except Exception:
-            _dismiss_iubenda(page)
-            submit.click(timeout=5000, force=True)
+            _dismiss_cookie_banner(page)
+            _click_mostra_risultato(page)
+            _wait_results_loaded(page)
 
-        try:
-            page.wait_for_load_state("networkidle", timeout=20000)
-        except Exception:
-            pass
+            blocks = _extract_blocks_from_page(page)
 
-        try:
-            page.get_by_text(re.compile(r"\bTRIBUNALE\b", re.I)).first.wait_for(timeout=15000)
-        except PlaywrightTimeoutError:
-            pass
+            notices: List[Notice] = []
+            for b in blocks:
+                header = _strip_spaces(b.get("header") or "")
+                body = (b.get("body") or "").strip()
+                link_objs = b.get("links") or []
+                flat_links = _flatten_links(link_objs)
 
-        page_text = page.inner_text("body")
-        blocks = _split_notices_from_page_text(page_text)
+                direct_raw = _pick_direct_link(link_objs)
+                direct = _resolve_final_url(direct_raw)
 
-        if not blocks and "LOTTO" in page_text.upper():
-            seg = _normalize_whitespace(page_text)
-            blocks = re.split(r"\n(?=LOTTO\s+\w+)", seg)
+                sale_dt = _parse_sale_date(body + " " + header)
 
-        # (html non essenziale qui, ma lasciato per future estensioni)
-        _ = page.content()
+                # SOLO attivi
+                if sale_dt is not None and sale_dt < date.today():
+                    continue
 
-        for b in blocks:
-            b_norm = _normalize_whitespace(b)
-            header = b_norm.splitlines()[0] if b_norm else "Annuncio"
-            sale_dt = _pick_sale_date(b_norm)
+                if (not direct) or direct == TRIBUNALE_URL:
+                    if flat_links:
+                        direct = _resolve_final_url(flat_links[0])
+                    else:
+                        direct = TRIBUNALE_URL
 
-            # filtra annunci passati
-            if sale_dt is not None and sale_dt < date.today():
-                continue
+                body_clean = _strip_spaces(body)
+                if len(body_clean) > 3200:
+                    body_clean = body_clean[:3200] + "…"
 
-            # URL presenti nel testo del singolo annuncio
-            urls = re.findall(r"(https?://\S+|www\.\S+)", b_norm)
-            cleaned: List[str] = []
-            for u in urls:
-                u = u.rstrip(").,;")
-                if u.startswith("www."):
-                    u = "https://" + u
-                cleaned.append(u)
-
-            # Link associati al singolo annuncio (solo quelli nel testo)
-            linkset: List[str] = []
-            for l in cleaned:
-                if l not in linkset:
-                    linkset.append(l)
-
-            # Link diretto per annuncio:
-            # - preferisce Portale Vendite Pubbliche / Giustizia (o redirect esvalabs)
-            # - fallback: primo link trovato, oppure pagina ricerca
-            def _is_direct(u: str) -> bool:
-                u = u.lower()
-                return (
-                    "portalevenditepubbliche" in u
-                    or "giustizia.it" in u
-                    or "esvalabs" in u
+                notices.append(
+                    Notice(
+                        comune=comune,
+                        header=header or "Annuncio",
+                        body=body_clean,
+                        direct_link=direct,
+                        links=tuple(flat_links[:10]),
+                        sale_date=sale_dt,
+                    )
                 )
 
-            direct_link = next((l for l in linkset if _is_direct(l)), "")
-            if not direct_link:
-                direct_link = linkset[0] if linkset else TRIBUNALE_URL
+            return notices
 
-            notices.append(
-                Notice(
-                    comune=comune,
-                    header=header,
-                    body=b_norm,
-                    direct_link=direct_link,
-                    links=tuple(linkset),
-                    sale_date=sale_dt,
-                )
-            )
-
-        browser.close()
-
-    return notices
+        finally:
+            browser.close()
 
 
+# -----------------------------
+# Email
+# -----------------------------
 def build_email_html(all_notices: List[Notice]) -> Tuple[str, str]:
     today = date.today().strftime("%d/%m/%Y")
     subject = f"Aste giudiziarie attive (BG) - report {today}"
 
-    by_comune: dict[str, List[Notice]] = {}
+    by_comune: Dict[str, List[Notice]] = {}
     for n in all_notices:
         by_comune.setdefault(n.comune, []).append(n)
 
     for k in by_comune:
-        by_comune[k] = sorted(by_comune[k], key=lambda x: (x.sale_date or date.max, x.header))
+        by_comune[k].sort(key=lambda x: (x.sale_date or date.max, x.header))
 
-    def esc(s: str) -> str:
-        return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+    html = []
+    html.append("<html><body style='font-family:Arial,Helvetica,sans-serif'>")
+    html.append(f"<h2>{subject}</h2>")
+    html.append("<p>Fonte: Tribunale di Bergamo – Vendite Giudiziarie</p>")
 
-    parts: List[str] = []
-    parts.append(f"<p><b>Fonte:</b> {esc(TRIBUNALE_URL)}</p>")
-    parts.append(
-        f"<p><b>Filtri:</b> Regione={esc(REGIONE)}; Provincia={esc(PROVINCIA)}; "
-        f"Comuni={', '.join(map(esc, COMUNI_TARGET))}</p>"
-    )
-
-    total = sum(len(v) for v in by_comune.values())
-    parts.append(f"<p><b>Totale annunci (attivi):</b> {total}</p>")
-
+    total = 0
     for comune in COMUNI_TARGET:
         lst = by_comune.get(comune, [])
-        parts.append(f"<h2>{esc(comune)} ({len(lst)})</h2>")
+        html.append(f"<h3>{comune} ({len(lst)})</h3>")
         if not lst:
-            parts.append("<p>Nessun annuncio attivo trovato.</p>")
+            html.append("<p><i>Nessun annuncio attivo trovato.</i></p>")
             continue
 
-        for i, n in enumerate(lst, 1):
+        html.append("<ul>")
+        for n in lst:
+            total += 1
             sale = n.sale_date.strftime("%d/%m/%Y") if n.sale_date else "n/d"
-            parts.append("<hr/>")
-            parts.append(f"<p><b>{i}. {esc(n.header)}</b><br/>")
-            parts.append(f"<b>Data rilevata:</b> {esc(sale)}<br/>")
-            parts.append(
-                f"<b>Link diretto:</b> <a href='{esc(n.direct_link)}'>{esc(n.direct_link)}</a></p>"
-            )
-
-            body = esc(n.body)
-            if len(body) > 3000:
-                body = body[:3000] + "…"
-            parts.append(
-                "<pre style='white-space:pre-wrap;font-family:ui-monospace,Consolas,monospace'>"
-                f"{body}</pre>"
-            )
-
+            html.append("<li style='margin-bottom:14px'>")
+            html.append(f"<b>{n.header}</b> – <span>Data vendita: {sale}</span><br>")
+            html.append(f"<a href='{n.direct_link}'>LINK DIRETTO ANNUNCIO</a><br>")
+            if n.body:
+                html.append(f"<div style='margin-top:6px;color:#222'>{n.body}</div>")
             if n.links:
-                parts.append(
-                    "<p><b>Altri link trovati:</b><br/>"
-                    + "<br/>".join(f"<a href='{esc(l)}'>{esc(l)}</a>" for l in n.links)
-                    + "</p>"
-                )
+                others = [u for u in n.links if u != n.direct_link][:3]
+                if others:
+                    html.append("<div style='margin-top:6px;font-size:12px'>Altri link: ")
+                    html.append(" | ".join([f"<a href='{u}'>apri</a>" for u in others]))
+                    html.append("</div>")
+            html.append("</li>")
+        html.append("</ul>")
 
-    html_body = "\n".join(parts)
-    return subject, html_body
+    html.append(f"<hr><p>Totale annunci (attivi): <b>{total}</b></p>")
+    html.append("</body></html>")
+
+    return subject, "".join(html)
 
 
 def send_email(subject: str, html_body: str) -> None:
-    smtp_host = os.getenv("SMTP_HOST", "").strip()
-    smtp_port = int(os.getenv("SMTP_PORT", "587").strip() or "587")
-    smtp_user = os.getenv("SMTP_USER", "").strip()
-    smtp_pass = os.getenv("SMTP_PASS", "").strip()
-    email_to = os.getenv("EMAIL_TO", "").strip()
+    host = os.getenv("SMTP_HOST", "")
+    port = int(os.getenv("SMTP_PORT", "587"))
+    user = os.getenv("SMTP_USER", "")
+    pwd = os.getenv("SMTP_PASS", "")
+    to_addr = os.getenv("EMAIL_TO", "")
 
-    missing = [
-        k
-        for k, v in {
-            "SMTP_HOST": smtp_host,
-            "SMTP_USER": smtp_user,
-            "SMTP_PASS": smtp_pass,
-            "EMAIL_TO": email_to,
-        }.items()
-        if not v
-    ]
-    if missing:
-        raise RuntimeError(f"Variabili d'ambiente mancanti per invio email: {', '.join(missing)}")
+    if not (host and user and pwd and to_addr):
+        raise RuntimeError("Credenziali SMTP mancanti (SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS/EMAIL_TO).")
 
-    msg = EmailMessage()
+    msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = smtp_user
-    msg["To"] = email_to
-    msg.set_content("Il tuo client non supporta HTML. Apri con un client che supporta HTML.")
-    msg.add_alternative(html_body, subtype="html")
+    msg["From"] = user
+    msg["To"] = to_addr
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    context = ssl.create_default_context()
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        server.ehlo()
-        server.starttls(context=context)
-        server.login(smtp_user, smtp_pass)
-        server.send_message(msg)
+    with smtplib.SMTP(host, port) as server:
+        server.starttls()
+        server.login(user, pwd)
+        server.sendmail(user, [to_addr], msg.as_string())
 
 
+# -----------------------------
+# Main
+# -----------------------------
 def main() -> int:
     all_notices: List[Notice] = []
 
     for comune in COMUNI_TARGET:
         try:
             notices = scrape_for_comune(comune)
+            log(f"{comune}: {len(notices)} annunci")
             all_notices.extend(notices)
         except Exception as e:
+            tb = traceback.format_exc()
             all_notices.append(
                 Notice(
                     comune=comune,
                     header=f"ERRORE scraping per {comune}",
-                    body=str(e),
+                    body=f"{e}\n\n{tb}",
                     direct_link=TRIBUNALE_URL,
                     links=(TRIBUNALE_URL,),
                     sale_date=None,
@@ -546,13 +672,14 @@ def main() -> int:
 
     if os.getenv("SMTP_HOST") and os.getenv("SMTP_USER") and os.getenv("SMTP_PASS") and os.getenv("EMAIL_TO"):
         send_email(subject, html_body)
-        print("Email inviata.")
+        log("Email inviata.")
     else:
         print(subject)
         print("=" * len(subject))
         for n in all_notices:
-            print(f"\n[{n.comune}] {n.header} (data={n.sale_date})\nLink diretto: {n.direct_link}")
-            print(n.body[:500])
+            print(f"\n[{n.comune}] {n.header} (data={n.sale_date})")
+            print(f"LINK: {n.direct_link}")
+            print(n.body[:600])
 
     return 0
 
