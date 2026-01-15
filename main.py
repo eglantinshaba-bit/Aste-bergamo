@@ -29,11 +29,17 @@ COMUNI = [
 ]
 
 ASTA_PER_PAGINA = "50"
-DEFAULT_TIMEOUT_MS = 55_000
+DEFAULT_TIMEOUT_MS = 60_000
 
+REGION_MARKERS = {
+    "Lombardia", "Veneto", "Lazio", "Sicilia", "Piemonte", "Toscana", "Puglia",
+    "Emilia-Romagna", "Campania", "Liguria", "Marche", "Calabria", "Sardegna"
+}
 
-REGION_MARKERS = {"Lombardia", "Veneto", "Lazio", "Sicilia", "Piemonte", "Toscana", "Puglia"}
-ORDINA_MARKERS = {"Convenienza", "Prezzo decrescente", "Prezzo crescente", "Data vendita decrescente"}
+ORDINA_MARKERS = {
+    "Convenienza", "Prezzo decrescente", "Prezzo crescente",
+    "Data vendita decrescente", "Data vendita crescente", "Data pubblicazione"
+}
 
 
 @dataclass(frozen=True)
@@ -56,6 +62,14 @@ def _strip_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
 
+def _norm(s: str) -> str:
+    s = (s or "").lower()
+    s = s.replace(".", " ")
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def _normalize_url(url: str) -> str:
     u = (url or "").strip()
     if not u:
@@ -76,7 +90,6 @@ def _try_extract_real_url_from_tracking(url: str) -> str:
     u = (url or "").strip()
     if not u:
         return u
-
     try:
         p = urlparse(u)
         host = (p.netloc or "").lower()
@@ -97,8 +110,6 @@ def _try_extract_real_url_from_tracking(url: str) -> str:
             return u
 
         candidate = m.group(1).strip()
-
-        # se contiene più "http://", prendi l’ultimo
         http_positions = [m.start() for m in re.finditer(r"https?://", candidate)]
         if len(http_positions) >= 2:
             candidate = candidate[http_positions[-1] :]
@@ -109,19 +120,12 @@ def _try_extract_real_url_from_tracking(url: str) -> str:
 
 
 def _resolve_final_url(url: str, timeout: int = 12) -> str:
-    """
-    Restituisce URL diretto stabile:
-    - decodifica tracking esvalabs
-    - segue redirect HTTP
-    """
     u = _normalize_url(url)
     if not u:
         return ""
-
     decoded = _try_extract_real_url_from_tracking(u)
     if decoded and decoded != u:
         return decoded
-
     try:
         r = requests.get(
             u,
@@ -147,7 +151,6 @@ def _extract_date_str(text: str) -> str:
 def _score_link(href: str, ctx: str) -> int:
     h = (href or "").lower().strip()
     c = (ctx or "").lower().strip()
-
     if not h:
         return -1
     if h.startswith("mailto:") or h.startswith("tel:"):
@@ -156,18 +159,15 @@ def _score_link(href: str, ctx: str) -> int:
         return -1
 
     score = 0
-
-    # PDF è il "link diretto" migliore
+    # PDF = migliore "link diretto"
     if ".pdf" in h:
         score += 200
         if "avviso" in c:
             score += 80
         if "perizia" in c:
             score += 50
-        if "foto" in c:
-            score += 10
-        if "planimetria" in c:
-            score += 10
+        if "ordinanza" in c:
+            score += 20
 
     # PVP
     if "portalevenditepubbliche.giustizia.it" in h:
@@ -177,7 +177,7 @@ def _score_link(href: str, ctx: str) -> int:
     if "esvalabs.com" in h:
         score += 60
 
-    # tribunale domain
+    # tribunale
     if "tribunale.bergamo.it" in h:
         score += 10
 
@@ -197,7 +197,6 @@ def _pick_best_direct_link(links: List[Dict[str, str]]) -> str:
 
     if not best:
         return TRIBUNALE_URL
-
     return _resolve_final_url(best)
 
 
@@ -205,12 +204,8 @@ def _pick_best_direct_link(links: List[Dict[str, str]]) -> str:
 # Playwright helpers
 # -----------------------------
 def _dismiss_cookie_banner(page) -> None:
-    """
-    Chiude banner Iubenda che blocca i click (intercepts pointer events).
-    """
     try:
         page.wait_for_timeout(250)
-
         candidates = [
             'button:has-text("Accetta")',
             'button:has-text("Accetto")',
@@ -229,7 +224,6 @@ def _dismiss_cookie_banner(page) -> None:
                 except Exception:
                     pass
 
-        # Fallback: rimuove overlay
         page.evaluate(
             """
             () => {
@@ -253,149 +247,113 @@ def _active_form(page):
     return form
 
 
-def _selects_snapshot(form) -> List[Dict]:
+def _snapshot_selects(form) -> List[Dict]:
     """
-    Torna lista di select nel form attivo con:
-    - idx: posizione nel DOM (form.querySelectorAll('select'))
-    - options: testi option normalizzati
+    Snapshot di tutti i select nel form attivo (visible o no) con opzioni.
     """
-    snap = form.evaluate(
+    return form.evaluate(
         """
         (f) => {
           const norm = (s) => (s || '').replace(/\\s+/g,' ').trim();
           const sels = Array.from(f.querySelectorAll('select'));
-          return sels.map((s, i) => {
+          return sels.map((s, idx) => {
+            const style = window.getComputedStyle(s);
+            const visible = style.display !== 'none' && style.visibility !== 'hidden' && s.offsetParent !== null;
             const opts = Array.from(s.options || []).map(o => norm(o.textContent));
-            return { idx: i, options: opts };
+            return { idx, visible, opts };
           });
         }
         """
-    )
-    return snap or []
+    ) or []
 
 
-def _find_select_idx_by_rule(snapshot: List[Dict], rule_name: str) -> int:
-    """
-    Identifica i select giusti SOLO guardando le opzioni.
-    """
-    for item in snapshot:
-        opts = set([o for o in item.get("options", []) if o])
-        if not opts:
-            continue
-
-        # Regione: contiene molte regioni note
-        if rule_name == "regione":
-            if len(REGION_MARKERS.intersection(opts)) >= 3:
-                return int(item["idx"])
-
-        # Aste per pagina: 10/25/50
-        if rule_name == "per_pagina":
-            if {"10", "25", "50"}.issubset(opts):
-                return int(item["idx"])
-
-        # Provincia: contiene Bergamo
-        if rule_name == "provincia":
-            if "Bergamo" in opts:
-                # evita di prendere "Ordina per"
-                if len(ORDINA_MARKERS.intersection(opts)) == 0:
-                    return int(item["idx"])
-
-        # Comune: contiene almeno uno dei comuni target
-        if rule_name == "comune":
-            if any(c in opts for c in COMUNI):
-                # evita "Ordina per"
-                if len(ORDINA_MARKERS.intersection(opts)) == 0:
-                    return int(item["idx"])
-
+def _find_select_idx_region(snapshot: List[Dict]) -> int:
+    for it in snapshot:
+        opts = set([o for o in it.get("opts", []) if o])
+        if len(REGION_MARKERS.intersection(opts)) >= 4:
+            return int(it["idx"])
     return -1
 
 
-def _wait_until_select_contains(form, select_idx: int, option_text: str, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> None:
-    form.evaluate(
-        """
-        ([idx, opt, timeout]) => {
-          const start = Date.now();
-          const norm = (s) => (s || '').replace(/\\s+/g,' ').trim();
-          const want = norm(opt).toLowerCase();
-          function has() {
-            const sel = document.querySelectorAll('select')[idx];
-            if (!sel) return false;
-            return Array.from(sel.options || []).some(o => norm(o.textContent).toLowerCase() === want);
-          }
-          return new Promise((resolve, reject) => {
-            const tick = () => {
-              if (has()) return resolve(true);
-              if (Date.now() - start > timeout) return reject("timeout");
-              setTimeout(tick, 200);
-            };
-            tick();
-          });
-        }
-        """,
-        [select_idx, option_text, timeout_ms],
-    )
+def _find_select_idx_provincia(snapshot: List[Dict]) -> int:
+    for it in snapshot:
+        opts = set([o for o in it.get("opts", []) if o])
+        if "Bergamo" in opts and len(ORDINA_MARKERS.intersection(opts)) == 0:
+            return int(it["idx"])
+    return -1
 
 
-def _select_option_by_text(form, select_idx: int, desired_text: str) -> None:
+def _find_select_idx_comune(snapshot: List[Dict]) -> int:
+    for it in snapshot:
+        opts = set([o for o in it.get("opts", []) if o])
+        if any(c in opts for c in COMUNI) and len(ORDINA_MARKERS.intersection(opts)) == 0:
+            return int(it["idx"])
+    return -1
+
+
+def _find_select_idx_per_pagina(snapshot: List[Dict]) -> int:
+    for it in snapshot:
+        opts = set([o for o in it.get("opts", []) if o])
+        if {"10", "25", "50"}.issubset(opts):
+            return int(it["idx"])
+    return -1
+
+
+def _choose_option_value(select_locator, desired: str) -> Tuple[str, str]:
     """
-    Seleziona una option usando value reale (robusto contro spazi / NBSP).
+    Ritorna (value,label) migliore per una option che matcha desired anche se il testo è tipo "Stezzano (BG)".
     """
+    desired_n = _norm(desired)
+
+    opts = select_locator.locator("option")
+    n = opts.count()
+
+    best_val = ""
+    best_label = ""
+    best_score = -1
+
+    for i in range(n):
+        lab = _strip_spaces(opts.nth(i).inner_text())
+        if not lab:
+            continue
+        val = opts.nth(i).get_attribute("value") or ""
+
+        lab_n = _norm(lab)
+
+        # punteggio: match esatto / contains / overlap token
+        score = 0
+        if lab.lower() == desired.lower():
+            score = 1000
+        elif desired_n == lab_n:
+            score = 900
+        elif desired_n in lab_n:
+            score = 700
+        else:
+            target_tokens = set(desired_n.split())
+            lab_tokens = set(lab_n.split())
+            score = 100 + len(target_tokens.intersection(lab_tokens)) * 10
+
+        # preferisci label più corta se score uguale
+        if score > best_score or (score == best_score and best_label and len(lab) < len(best_label)):
+            best_score = score
+            best_val = val
+            best_label = lab
+
+    if best_score < 150:
+        raise RuntimeError(f"Option '{desired}' non trovata in questo select.")
+
+    return best_val, best_label
+
+
+def _select_value(form, select_idx: int, desired_text: str) -> str:
     sel = form.locator("select").nth(select_idx)
     sel.wait_for(state="attached", timeout=DEFAULT_TIMEOUT_MS)
-
-    desired_norm = _strip_spaces(desired_text).lower()
-    options = sel.locator("option")
-    count = options.count()
-
-    best_value = None
-    best_label = None
-
-    for i in range(count):
-        t = _strip_spaces(options.nth(i).inner_text())
-        if not t:
-            continue
-        if t.lower() == desired_norm:
-            best_label = t
-            best_value = options.nth(i).get_attribute("value")
-            break
-
-    # fallback "contains"
-    if best_label is None:
-        for i in range(count):
-            t = _strip_spaces(options.nth(i).inner_text())
-            if desired_norm in t.lower():
-                best_label = t
-                best_value = options.nth(i).get_attribute("value")
-                break
-
-    if best_label is None:
-        raise RuntimeError(f"Option '{desired_text}' non trovata nel select idx={select_idx}")
-
-    if best_value:
-        sel.select_option(value=best_value)
+    value, label = _choose_option_value(sel, desired_text)
+    if value:
+        sel.select_option(value=value)
     else:
-        sel.select_option(label=best_label)
-
-
-def _uncheck_include_past_if_present(page) -> None:
-    try:
-        cb = page.get_by_label("Includi le aste passate")
-        if cb.count() > 0:
-            try:
-                if cb.is_checked():
-                    cb.uncheck()
-            except Exception:
-                page.evaluate(
-                    """
-                    () => {
-                      const inputs = Array.from(document.querySelectorAll('input[type=checkbox]'));
-                      const el = inputs.find(i => (i.closest('label') && i.closest('label').innerText || '').toLowerCase().includes('aste passate'));
-                      if (el) el.checked = false;
-                    }
-                    """
-                )
-    except Exception:
-        pass
+        sel.select_option(label=label)
+    return label
 
 
 def _click_mostra_risultato(page) -> None:
@@ -405,7 +363,7 @@ def _click_mostra_risultato(page) -> None:
 
 
 def _wait_results_or_empty(page) -> None:
-    page.wait_for_timeout(800)
+    page.wait_for_timeout(700)
     page.wait_for_function(
         """
         () => {
@@ -419,9 +377,7 @@ def _wait_results_or_empty(page) -> None:
 
 def _extract_blocks(page) -> List[Dict]:
     """
-    Estrae annunci come blocchi delimitati da header:
-    "TRIBUNALE DI ... LOTTO ..."
-    e raccoglie link presenti nel blocco.
+    Blocco annuncio = header che contiene 'TRIBUNALE' e 'LOTTO'
     """
     js = r"""
     () => {
@@ -444,7 +400,7 @@ def _extract_blocks(page) -> List[Dict]:
         const tu = U(t);
         if (!tu.startsWith('TRIBUNALE')) return false;
         if (!tu.includes('LOTTO')) return false;
-        if (tu.length > 260) return false;
+        if (tu.length > 280) return false;
         return true;
       };
 
@@ -488,7 +444,7 @@ def _extract_blocks(page) -> List[Dict]:
         if (['P','DIV','LI'].includes(tag)) {
           const txt = norm(node.innerText);
           if (txt && !U(txt).startsWith('TRIBUNALE')) {
-            if (txt.length <= 3000) current.textParts.push(txt);
+            if (txt.length <= 4000) current.textParts.push(txt);
           }
         }
 
@@ -496,10 +452,7 @@ def _extract_blocks(page) -> List[Dict]:
         anchors.forEach(a => {
           const href = a.href || a.getAttribute('href') || '';
           if (!href) return;
-
-          let ctx = norm((a.closest('td') && a.closest('td').innerText) ? a.closest('td').innerText : (a.parentElement ? a.parentElement.innerText : a.innerText));
-          if (!ctx) ctx = norm(a.innerText || '');
-
+          const ctx = norm((a.closest('td') && a.closest('td').innerText) ? a.closest('td').innerText : (a.parentElement ? a.parentElement.innerText : a.innerText));
           current.links.push({ href, ctx });
         });
       }
@@ -512,158 +465,105 @@ def _extract_blocks(page) -> List[Dict]:
 
 
 # -----------------------------
-# Core scraper (1 browser, loop comuni)
+# Scrape 1 comune (pagina fresca)
 # -----------------------------
-def scrape_all_comuni() -> Dict[str, List[Notice]]:
-    headless = (os.getenv("HEADLESS", "1").strip().lower() not in {"0", "false", "no"})
+def scrape_single_comune(page, comune: str) -> List[Notice]:
+    page.goto(TRIBUNALE_URL, wait_until="domcontentloaded")
+    _dismiss_cookie_banner(page)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        page = browser.new_page()
-        page.set_default_timeout(DEFAULT_TIMEOUT_MS)
+    # Beni Immobili + Ricerca Generale
+    page.get_by_text("Beni Immobili", exact=False).first.click(timeout=DEFAULT_TIMEOUT_MS)
+    page.wait_for_timeout(400)
+    page.get_by_text("Ricerca Generale", exact=False).first.click(timeout=DEFAULT_TIMEOUT_MS)
+    page.wait_for_timeout(700)
+    _dismiss_cookie_banner(page)
 
+    form = _active_form(page)
+
+    # Trova indici select dal contenuto opzioni
+    snap = _snapshot_selects(form)
+
+    regione_idx = _find_select_idx_region(snap)
+    if regione_idx < 0:
+        raise RuntimeError("Select REGIONE non identificato (opzioni regioni non trovate).")
+
+    # Seleziona regione
+    selected_regione = _select_value(form, regione_idx, REGIONE)
+    page.wait_for_timeout(800)
+
+    snap2 = _snapshot_selects(form)
+    provincia_idx = _find_select_idx_provincia(snap2)
+    if provincia_idx < 0:
+        page.wait_for_timeout(1400)
+        snap2 = _snapshot_selects(form)
+        provincia_idx = _find_select_idx_provincia(snap2)
+
+    if provincia_idx < 0:
+        raise RuntimeError("Select PROVINCIA non identificato (Bergamo non trovato).")
+
+    selected_prov = _select_value(form, provincia_idx, PROVINCIA)
+    page.wait_for_timeout(1200)
+
+    snap3 = _snapshot_selects(form)
+    comune_idx = _find_select_idx_comune(snap3)
+    if comune_idx < 0:
+        page.wait_for_timeout(1500)
+        snap3 = _snapshot_selects(form)
+        comune_idx = _find_select_idx_comune(snap3)
+
+    if comune_idx < 0:
+        raise RuntimeError("Select COMUNE non identificato (lista comuni non caricata).")
+
+    # per pagina
+    per_pag_idx = _find_select_idx_per_pagina(snap3)
+    if per_pag_idx >= 0:
         try:
-            page.goto(TRIBUNALE_URL, wait_until="domcontentloaded")
-            _dismiss_cookie_banner(page)
+            _select_value(form, per_pag_idx, ASTA_PER_PAGINA)
+        except Exception:
+            pass
 
-            # Beni Immobili + Ricerca Generale
-            page.get_by_text("Beni Immobili", exact=False).first.click(timeout=DEFAULT_TIMEOUT_MS)
-            page.wait_for_timeout(400)
-            page.get_by_text("Ricerca Generale", exact=False).first.click(timeout=DEFAULT_TIMEOUT_MS)
-            page.wait_for_timeout(600)
+    # seleziona comune
+    selected_comune = _select_value(form, comune_idx, comune)
+    log(f"[OK] Comune richiesto='{comune}' selezionato='{selected_comune}' | Regione='{selected_regione}' Provincia='{selected_prov}'")
+    page.wait_for_timeout(500)
 
-            _dismiss_cookie_banner(page)
+    _click_mostra_risultato(page)
+    _wait_results_or_empty(page)
 
-            form = _active_form(page)
+    txt = (page.inner_text("body") or "").lower()
+    if ("nessun" in txt or "nessuna" in txt) and ("lotto" not in txt):
+        return []
 
-            # Snapshot selects
-            snap = _selects_snapshot(form)
-            if not snap:
-                raise RuntimeError("Nessun <select> trovato nel form attivo.")
+    blocks = _extract_blocks(page)
 
-            regione_idx = _find_select_idx_by_rule(snap, "regione")
-            per_pagina_idx = _find_select_idx_by_rule(snap, "per_pagina")
+    notices: List[Notice] = []
+    for b in blocks:
+        header = _strip_spaces(b.get("header") or "")
+        body = _strip_spaces(b.get("body") or "")
+        sale_date = _extract_date_str(header + " " + body)
 
-            if regione_idx < 0:
-                raise RuntimeError("Impossibile identificare il select REGIONE dal form attivo (opzioni non riconosciute).")
+        raw_links = b.get("links") or []
+        links: List[Dict[str, str]] = []
+        for o in raw_links:
+            href = _normalize_url(o.get("href", ""))
+            if not href:
+                continue
+            ctx = _strip_spaces(o.get("ctx", ""))
+            links.append({"href": href, "ctx": ctx})
 
-            # Set regione
-            _select_option_by_text(form, regione_idx, REGIONE)
-            page.wait_for_timeout(700)
+        direct = _pick_best_direct_link(links)
 
-            # Dopo regione, aggiorna snapshot per trovare provincia/comune
-            snap2 = _selects_snapshot(form)
-            provincia_idx = _find_select_idx_by_rule(snap2, "provincia")
-            if provincia_idx < 0:
-                # aspetta che appaia Bergamo
-                # trova il primo select che inizia a popolarsi con province
-                for item in snap2:
-                    if item.get("options") and len(item["options"]) > 3:
-                        if any(o.endswith("(BG)") or o == "Bergamo" for o in item["options"]):
-                            provincia_idx = int(item["idx"])
-                            break
-            if provincia_idx < 0:
-                # retry forte (AJAX)
-                page.wait_for_timeout(1500)
-                snap2 = _selects_snapshot(form)
-                provincia_idx = _find_select_idx_by_rule(snap2, "provincia")
+        notices.append(
+            Notice(
+                comune=comune,
+                header=header or "Annuncio",
+                body=body[:3500] + ("…" if len(body) > 3500 else ""),
+                direct_link=direct or TRIBUNALE_URL,
+                sale_date=sale_date,
+            )
+        )
 
-            if provincia_idx < 0:
-                raise RuntimeError("Impossibile identificare il select PROVINCIA (Bergamo non disponibile).")
-
-            _select_option_by_text(form, provincia_idx, PROVINCIA)
-            page.wait_for_timeout(900)
-
-            # comune idx (dopo provincia)
-            snap3 = _selects_snapshot(form)
-            comune_idx = _find_select_idx_by_rule(snap3, "comune")
-            if comune_idx < 0:
-                page.wait_for_timeout(1200)
-                snap3 = _selects_snapshot(form)
-                comune_idx = _find_select_idx_by_rule(snap3, "comune")
-
-            if comune_idx < 0:
-                raise RuntimeError("Impossibile identificare il select COMUNE (opzioni comuni non disponibili).")
-
-            # Aste per pagina
-            if per_pagina_idx >= 0:
-                try:
-                    _select_option_by_text(form, per_pagina_idx, ASTA_PER_PAGINA)
-                    page.wait_for_timeout(300)
-                except Exception:
-                    pass
-
-            _uncheck_include_past_if_present(page)
-            _dismiss_cookie_banner(page)
-
-            results: Dict[str, List[Notice]] = {}
-
-            for comune in COMUNI:
-                try:
-                    log(f"Scraping comune: {comune}")
-
-                    # seleziona comune (aspetta che esista l'opzione)
-                    _select_option_by_text(form, comune_idx, comune)
-                    page.wait_for_timeout(450)
-
-                    _click_mostra_risultato(page)
-                    _wait_results_or_empty(page)
-
-                    page_text = (page.inner_text("body") or "").lower()
-                    if ("nessun" in page_text or "nessuna" in page_text) and ("lotto" not in page_text):
-                        results[comune] = []
-                        log(f" -> trovati: 0 (nessun annuncio)")
-                        continue
-
-                    blocks = _extract_blocks(page)
-                    notices: List[Notice] = []
-
-                    for b in blocks:
-                        header = _strip_spaces(b.get("header") or "")
-                        body = _strip_spaces(b.get("body") or "")
-                        sale_date = _extract_date_str(header + " " + body)
-
-                        raw_links = b.get("links") or []
-                        links: List[Dict[str, str]] = []
-                        for o in raw_links:
-                            href = _normalize_url(o.get("href", ""))
-                            if not href:
-                                continue
-                            ctx = _strip_spaces(o.get("ctx", ""))
-                            links.append({"href": href, "ctx": ctx})
-
-                        direct = _pick_best_direct_link(links)
-
-                        notices.append(
-                            Notice(
-                                comune=comune,
-                                header=header or "Annuncio",
-                                body=body[:3500] + ("…" if len(body) > 3500 else ""),
-                                direct_link=direct or TRIBUNALE_URL,
-                                sale_date=sale_date,
-                            )
-                        )
-
-                    results[comune] = notices
-                    log(f" -> trovati: {len(notices)}")
-
-                except Exception as e:
-                    tb = traceback.format_exc()
-                    results[comune] = [
-                        Notice(
-                            comune=comune,
-                            header=f"ERRORE scraping per {comune}",
-                            body=f"{e}\n\n{tb}",
-                            direct_link=TRIBUNALE_URL,
-                            sale_date="n/d",
-                        )
-                    ]
-                    log(f" -> ERRORE {comune}: {e}")
-
-            return results
-
-        finally:
-            browser.close()
+    return notices
 
 
 # -----------------------------
@@ -734,21 +634,39 @@ def send_email(subject: str, html_body: str) -> None:
 # Main
 # -----------------------------
 def main() -> int:
-    try:
-        results = scrape_all_comuni()
-    except Exception as e:
-        tb = traceback.format_exc()
-        results = {
-            "ERRORE": [
-                Notice(
-                    comune="ERRORE",
-                    header="ERRORE GENERALE SCRAPING",
-                    body=f"{e}\n\n{tb}",
-                    direct_link=TRIBUNALE_URL,
-                    sale_date="n/d",
-                )
-            ]
-        }
+    results: Dict[str, List[Notice]] = {}
+
+    headless = (os.getenv("HEADLESS", "1").strip().lower() not in {"0", "false", "no"})
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+
+        try:
+            for comune in COMUNI:
+                page = browser.new_page()
+                page.set_default_timeout(DEFAULT_TIMEOUT_MS)
+
+                try:
+                    log(f"=== COMUNE: {comune} ===")
+                    results[comune] = scrape_single_comune(page, comune)
+                    log(f" -> trovati: {len(results[comune])}")
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    results[comune] = [
+                        Notice(
+                            comune=comune,
+                            header=f"ERRORE scraping per {comune}",
+                            body=f"{e}\n\n{tb}",
+                            direct_link=TRIBUNALE_URL,
+                            sale_date="n/d",
+                        )
+                    ]
+                    log(f" -> ERRORE {comune}: {e}")
+                finally:
+                    page.close()
+
+        finally:
+            browser.close()
 
     subject, html = build_email_html(results)
 
@@ -758,11 +676,6 @@ def main() -> int:
     else:
         log("SMTP non configurato: stampo risultati a console.")
         print(subject)
-        for c, lst in results.items():
-            print(f"\n{c} ({len(lst)})")
-            for n in lst[:3]:
-                print(" -", n.header)
-                print("   LINK:", n.direct_link)
 
     return 0
 
