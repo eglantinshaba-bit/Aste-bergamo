@@ -2,8 +2,8 @@ name: Aste Bergamo (email)
 
 on:
   schedule:
-    # GitHub Actions usa UTC.
-    # 17:07 UTC = 18:07 CET (inverno)
+    # GitHub Actions usa UTC
+    # 17:07 UTC = 18:07 CET
     - cron: "7 17 * * 2"
   workflow_dispatch:
 
