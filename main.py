@@ -1,10 +1,11 @@
 import os
 import re
+import json
 import time
 import smtplib
 import requests
-from dataclasses import dataclass
-from typing import List, Dict
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Tuple
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from urllib.parse import urlencode, urljoin
@@ -21,7 +22,6 @@ TRIB_DOMAIN = "https://www.tribunale.bergamo.it"
 REGIONE = "Lombardia"
 PROVINCIA = "Bergamo"
 
-# COMUNI target (Grassobbio corretto con doppia B)
 COMUNI = [
     "Azzano San Paolo",
     "Stezzano",
@@ -44,6 +44,12 @@ EMAIL_USER = os.environ.get("EMAIL_USER", "").strip()
 EMAIL_PASS = os.environ.get("EMAIL_PASS", "").strip()
 EMAIL_TO = os.environ.get("EMAIL_TO", "eglantinshaba@gmail.com").strip()
 
+# Stato (per invio solo se novità)
+STATE_PATH = os.environ.get("STATE_PATH", ".state/state.json").strip()
+
+# Se vuoi testare l’invio anche senza novità (solo per debug)
+FORCE_EMAIL = os.environ.get("FORCE_EMAIL", "0").strip() == "1"
+
 
 @dataclass
 class Notice:
@@ -53,6 +59,16 @@ class Notice:
     prezzo_base: str
     link_diretto: str
     link_ricerca: str
+
+    def fingerprint(self) -> str:
+        """
+        Identificatore univoco annuncio:
+        - prima scelta: link diretto
+        - fallback: titolo + data + prezzo
+        """
+        if self.link_diretto and self.link_diretto.startswith("http"):
+            return self.link_diretto.strip()
+        return f"{self.titolo}|{self.data_vendita}|{self.prezzo_base}".strip()
 
 
 def norm_comune(c: str) -> str:
@@ -80,7 +96,7 @@ def build_search_url(comune: str) -> str:
 
 def http_get(url: str) -> str:
     headers = {
-        "User-Agent": "Mozilla/5.0 (AsteBergamoBot/FINAL)",
+        "User-Agent": "Mozilla/5.0 (AsteBergamoBot/UPDATES)",
         "Accept-Language": "it-IT,it;q=0.9,en;q=0.7",
     }
     last_err = None
@@ -116,7 +132,6 @@ def climb_block(a_tag) -> str:
         parent = getattr(current, "parent", None)
         if parent is None:
             break
-
         if getattr(parent, "name", "") in ("body", "html"):
             break
 
@@ -141,7 +156,6 @@ def scrape_comune(comune_raw: str) -> List[Notice]:
     html = http_get(url)
     soup = BeautifulSoup(html, "lxml")
 
-    # Link diretto annuncio = "Scheda dettagliata"
     schede = soup.find_all("a", string=re.compile(r"scheda\s+dettagliata", re.I))
 
     notices: List[Notice] = []
@@ -165,13 +179,11 @@ def scrape_comune(comune_raw: str) -> List[Notice]:
 
         block_text = climb_block(a)
 
-        # Estraggo info principali (robuste)
         data_v = extract_first(block_text, r"Data\s+(\d{2}/\d{2}/\d{4}\s*-\s*\d{2}:\d{2})", "n/d", re.I)
         prezzo = extract_first(block_text, r"Prezzo\s+base\s+€\s*([0-9\.\,]+)", "n/d", re.I)
         if prezzo != "n/d":
             prezzo = f"€ {prezzo}"
 
-        # Titolo compatto (procedura/lotto se presente)
         proc = extract_first(block_text, r"Procedura\s+([0-9]{1,6}/[0-9]{4})", "", re.I)
         lotto = extract_first(block_text, r"\bLotto\s+([0-9]+)\b", "", re.I)
         tipologia = extract_first(block_text, r"Tipologia\s+(.+?)\s+Quota", "", re.I)
@@ -194,49 +206,82 @@ def scrape_comune(comune_raw: str) -> List[Notice]:
                 titolo=titolo,
                 data_vendita=data_v,
                 prezzo_base=prezzo,
-                link_diretto=href,         # ✅ LINK DIRETTO
-                link_ricerca=url,          # link ricerca tribunale
+                link_diretto=href,  # ✅ LINK DIRETTO ANNUNCIO
+                link_ricerca=url,
             )
         )
 
     return notices
 
 
-def format_email(results: Dict[str, List[Notice]], errors: Dict[str, str]) -> str:
+# =========================
+# STATE (solo se aggiornamenti)
+# =========================
+def load_state(path: str) -> Dict[str, List[str]]:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {str(k): list(v) for k, v in data.items()}
+        return {}
+    except Exception:
+        return {}
+
+
+def save_state(path: str, state: Dict[str, List[str]]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def diff_new(results: Dict[str, List[Notice]], prev_state: Dict[str, List[str]]) -> Dict[str, List[Notice]]:
+    """
+    ritorna solo i nuovi annunci (non visti prima).
+    """
+    new_map: Dict[str, List[Notice]] = {}
+    for comune, notices in results.items():
+        prev = set(prev_state.get(comune, []))
+        new_items = [n for n in notices if n.fingerprint() not in prev]
+        new_map[comune] = new_items
+    return new_map
+
+
+def build_next_state(results: Dict[str, List[Notice]]) -> Dict[str, List[str]]:
+    return {comune: [n.fingerprint() for n in notices] for comune, notices in results.items()}
+
+
+# =========================
+# EMAIL
+# =========================
+def format_email_only_updates(new_items: Dict[str, List[Notice]]) -> str:
     out: List[str] = []
-    out.append(f"Aste attive – Tribunale di Bergamo – {time.strftime('%d/%m/%Y')}")
+    out.append(f"NUOVI ANNUNCI – Tribunale di Bergamo – {time.strftime('%d/%m/%Y %H:%M')}")
     out.append("")
 
+    total = 0
     for comune in [norm_comune(c) for c in COMUNI]:
-        lst = results.get(comune, [])
-        err = errors.get(comune)
+        lst = new_items.get(comune, [])
+        if not lst:
+            continue
 
         out.append(f"{comune} ({len(lst)})")
-
-        if err:
-            out.append(f"ERRORE scraping per {comune}")
-            out.append(f"Dettaglio: {err}")
-            out.append(f"LINK RICERCA: {build_search_url(comune)}")
-            out.append("")
-            continue
-
-        if not lst:
-            out.append("Nessun annuncio attivo trovato.")
-            out.append("")
-            continue
-
         for i, n in enumerate(lst, 1):
+            total += 1
             out.append(f"{i}. {n.titolo}")
             out.append(f"   Data vendita: {n.data_vendita}")
             out.append(f"   Prezzo base: {n.prezzo_base}")
-            out.append(f"   LINK DIRETTO ANNUNCIO: {n.link_diretto}")
-            out.append(f"   LINK RICERCA TRIBUNALE: {n.link_ricerca}")
+            out.append(f"   LINK DIRETTO: {n.link_diretto}")
+            out.append(f"   LINK RICERCA: {n.link_ricerca}")
             out.append("")
+        out.append("")
 
+    out.append(f"Totale nuovi annunci: {total}")
     return "\n".join(out).strip()
 
 
-def send_email(body: str) -> None:
+def send_email(subject: str, body: str) -> None:
     """
     Se SMTP fallisce, NON deve far fallire il job.
     """
@@ -247,7 +292,7 @@ def send_email(body: str) -> None:
     msg = MIMEMultipart()
     msg["From"] = EMAIL_USER
     msg["To"] = EMAIL_TO
-    msg["Subject"] = "Aste attive - Tribunale di Bergamo (comuni selezionati)"
+    msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain", "utf-8"))
 
     try:
@@ -260,22 +305,40 @@ def send_email(body: str) -> None:
 
 
 def main() -> int:
+    # 1) scrape
     results: Dict[str, List[Notice]] = {norm_comune(c): [] for c in COMUNI}
-    errors: Dict[str, str] = {}
-
     for comune in COMUNI:
         c = norm_comune(comune)
         try:
             results[c] = scrape_comune(c)
         except Exception as e:
-            errors[c] = str(e)
+            # se un comune fallisce, non blocchiamo
+            print(f"[ERRORE] {c}: {e}")
+            results[c] = []
 
-    body = format_email(results, errors)
-    print(body)
+    # 2) carica stato precedente
+    prev = load_state(STATE_PATH)
 
-    send_email(body)
+    # 3) calcola nuovi annunci
+    new_items = diff_new(results, prev)
 
-    # ✅ mai fallire GitHub Actions
+    any_new = any(len(v) > 0 for v in new_items.values())
+    total_new = sum(len(v) for v in new_items.values())
+
+    # 4) salva nuovo stato sempre
+    next_state = build_next_state(results)
+    save_state(STATE_PATH, next_state)
+    print(f"Stato salvato in {STATE_PATH}")
+
+    # 5) invia mail solo se ci sono aggiornamenti
+    if any_new or FORCE_EMAIL:
+        subject = f"Nuovi annunci aste BG ({total_new})"
+        body = format_email_only_updates(new_items) if any_new else "FORCE_EMAIL attivo: nessuna novità reale."
+        send_email(subject, body)
+    else:
+        print("Nessun annuncio nuovo: nessuna email inviata.")
+
+    # ✅ job sempre SUCCESS
     return 0
 
 
