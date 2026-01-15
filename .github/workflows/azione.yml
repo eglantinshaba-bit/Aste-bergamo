@@ -2,6 +2,7 @@ name: Aste Bergamo (email)
 
 on:
   schedule:
+    # GitHub Actions usa UTC
     # 17:07 UTC = 18:07 CET (inverno)
     - cron: "7 17 * * 2"
   workflow_dispatch:
@@ -23,15 +24,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Install Playwright Chromium
-        run: python -m playwright install --with-deps chromium
-
-      - name: Run scraper
+      - name: Run
         env:
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           EMAIL_TO: "eglantinshaba@gmail.com"
-          HEADLESS: "1"
         run: python main.py
